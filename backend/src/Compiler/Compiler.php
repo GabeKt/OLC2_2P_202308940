@@ -11,6 +11,8 @@ use Visitor\AssignmentChecker;
 use Visitor\TypeChecker;
 use Visitor\ConstantCollector;
 use Visitor\Interpreter;
+use Visitor\OffsetCalculator;
+use Visitor\CodeGenerator;
 
 class Compiler
 {
@@ -77,6 +79,8 @@ class Compiler
         if ($errorReporter->hasErrors()) {
             return [
                 'output'  => '',
+                'arm64'   => '',
+                'execution_output' => '',
                 'errors'  => $errors,
                 'symbols' => $this->buildSymbolTable($symbolTable),
             ];
