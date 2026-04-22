@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Golampi IDE</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+
+  <header class="header">
+    <div class="header__brand">
+      <span class="header__logo">⬡</span>
+      <span class="header__title">GOLAMPI</span>
+    </div>
+    <div class="header__actions">
+      <button class="btn btn--ghost" id="btn-new">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>
+        Nuevo
+      </button>
+      <button class="btn btn--ghost" id="btn-load">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+        Cargar
+      </button>
+      <button class="btn btn--ghost" id="btn-save">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21H5a2 2 0 01-2-2V5a2 2 0 012-2h11l5 5v11a2 2 0 01-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
+        Guardar
+      </button>
+      <button class="btn btn--primary" id="btn-run">
+        <svg viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+        Ejecutar
+      </button>
+      <input type="file" id="file-input" accept=".go,.golampi,.txt" hidden />
+    </div>
+  </header>
+
+  <main class="workspace">
+
+    <!-- ── Editor ── -->
+    <section class="panel panel--editor">
+      <div class="panel__header">
+        <span class="panel__dot panel__dot--red"></span>
+        <span class="panel__dot panel__dot--yellow"></span>
+        <span class="panel__dot panel__dot--green"></span>
+        <span class="panel__label">editor.golampi</span>
+        <span class="panel__badge" id="editor-lines">0 líneas</span>
+      </div>
+      <div class="editor-wrap">
+        <div class="line-numbers" id="line-numbers"></div>
+        <textarea
+          id="code-editor"
+          class="code-editor"
+          spellcheck="false"
+          autocomplete="off"
+          autocorrect="off"
+          autocapitalize="off"
+          placeholder="// Escribe tu código Golampi aquí..."></textarea>
+      </div>
+    </section>
+
+    <!-- ── Panel derecho unificado ── -->
+    <section class="panel panel--right">
+
+      <!-- Header con tabs de navegación -->
+      <div class="panel__header right-header">
+        <span class="panel__dot panel__dot--red"></span>
+        <span class="panel__dot panel__dot--yellow"></span>
+        <span class="panel__dot panel__dot--green"></span>
+
+        <div class="view-tabs">
+          <button class="view-tab view-tab--active" data-view="console">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+            Consola
+          </button>
+          <button class="view-tab" data-view="errors" id="tab-errors-btn">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+            Errores
+            <span class="view-tab__badge" id="badge-errors">0</span>
+          </button>
+          <button class="view-tab" data-view="symbols" id="tab-symbols-btn">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+            Símbolos
+            <span class="view-tab__badge" id="badge-symbols">0</span>
+          </button>
+        </div>
+
+        <div class="right-header__actions">
+          <button class="btn btn--tiny" id="btn-clear-console" title="Limpiar consola">⌫</button>
+          <button class="btn btn--tiny btn--dl" id="btn-dl-output"  disabled title="Descargar salida">↓ salida</button>
+          <button class="btn btn--tiny btn--dl" id="btn-dl-errors"  disabled title="Descargar errores">↓ errores</button>
+          <button class="btn btn--tiny btn--dl" id="btn-dl-symbols" disabled title="Descargar símbolos">↓ símbolos</button>
+        </div>
+      </div>
+
+      <!-- Vista: Consola -->
+      <div class="right-view right-view--active" id="view-console">
+        <div class="console" id="console">
+          <span class="console__placeholder">// La salida del intérprete aparecerá aquí...</span>
+        </div>
+      </div>
+
+      <!-- Vista: Errores -->
+      <div class="right-view" id="view-errors">
+        <div class="report-placeholder" id="errors-placeholder">
+          <span>// Ejecuta el código para ver los errores.</span>
+        </div>
+        <div class="report-table-wrap" id="errors-table" hidden>
+          <table class="report-table">
+            <thead><tr><th>TIPO</th><th>DESCRIPCIÓN</th><th>LÍNEA</th><th>COL</th></tr></thead>
+            <tbody id="errors-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Vista: Símbolos -->
+      <div class="right-view" id="view-symbols">
+        <div class="report-placeholder" id="symbols-placeholder">
+          <span>// Ejecuta el código para ver la tabla de símbolos.</span>
+        </div>
+        <div class="report-table-wrap" id="symbols-table" hidden>
+          <table class="report-table">
+            <thead><tr><th>NOMBRE</th><th>TIPO</th><th>CLASE</th><th>VALOR</th><th>ÁMBITO</th><th>LÍNEA</th></tr></thead>
+            <tbody id="symbols-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+
+    </section>
+  </main>
+
+  <div class="loader-overlay" id="loader" hidden>
+    <div class="loader__box">
+      <div class="loader__ring"></div>
+      <span class="loader__text">Compilando...</span>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+  <script src="js/app.js"></script>
+</body>
+</html>
