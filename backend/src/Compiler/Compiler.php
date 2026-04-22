@@ -79,12 +79,41 @@ class Compiler
         if ($errorReporter->hasErrors()) {
             return [
                 'output'  => '',
-                'arm64'   => '',
+                'arm64'   => '', 
                 'execution_output' => '',
                 'errors'  => $errors,
                 'symbols' => $this->buildSymbolTable($symbolTable),
             ];
         }
+
+        // ── Pasada 5: calcular offsets para variables locales ─────────────────
+        $offsetCalculator = new OffsetCalculator($symbolTable);
+        $offsetCalculator->visit($tree);
+
+        // ── Pasada 6: generar código ensamblador ───────────────────────────────
+        $codeGenerator = new CodeGenerator($symbolTable);
+        $codeGenerator->visit($tree);
+        $codeGenerator->emitRuntimeHelpers();
+        $arm64Code = $codeGenerator->getAssembly();
+
+        // ── Pasada 7: ejecutar código ARM64 ────────────────────────────────────
+        $execResult = $this->executeArm64($arm64Code);
+
+        // Leer valores finales del Environment (runtime)
+        $interpreter = new Interpreter($symbolTable);
+        $interpreter->run($tree);
+        $globalValues = $interpreter->getEnv()->getGlobalValues();
+        foreach ($globalValues as $name => $value) {
+            $symbolTable->setValue($name, $value);
+        }
+
+        return [
+            'output' => $execResult['output'],
+            'arm64'  => $arm64Code,
+            'execution_output' => $execResult['output'],
+            'errors' => [],
+            'symbols' => $this->buildSymbolTable($symbolTable),
+        ];
 
         // ── Ejecutar ──────────────────────────────────────────────────────────
         $interpreter = new Interpreter($symbolTable);
