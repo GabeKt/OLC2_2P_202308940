@@ -42,6 +42,8 @@ require_once __DIR__ . '/../src/Visitor/VariableCollector.php';
 require_once __DIR__ . '/../src/Visitor/AssignmentChecker.php';
 require_once __DIR__ . '/../src/Visitor/TypeChecker.php';
 require_once __DIR__ . '/../src/Visitor/Interpreter.php';
+require_once __DIR__ . '/../src/Visitor/OffsetCalculator.php';
+require_once __DIR__ . '/../src/Visitor/CodeGenerator.php';
 require_once __DIR__ . '/../src/Compiler/Compiler.php';
 
 try {
@@ -50,6 +52,8 @@ try {
 
     echo json_encode([
         'output'  => $result['output']  ?? '',
+        'arm64'   => $result['arm64']   ?? '',
+        'execution_output' => $result['execution_output'] ?? '',
         'errors'  => $result['errors']  ?? [],
         'symbols' => $result['symbols'] ?? [],
         'success' => empty($result['errors']),

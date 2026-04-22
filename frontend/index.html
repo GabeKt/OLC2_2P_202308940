@@ -15,6 +15,7 @@
     <div class="header__brand">
       <span class="header__logo">⬡</span>
       <span class="header__title">GOLAMPI</span>
+      <span class="header__sub">INTERPRETER v1.0</span>
     </div>
     <div class="header__actions">
       <button class="btn btn--ghost" id="btn-new">
@@ -85,11 +86,16 @@
             Símbolos
             <span class="view-tab__badge" id="badge-symbols">0</span>
           </button>
+          <button class="view-tab" data-view="arm64">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
+            ARM64
+          </button>
         </div>
 
         <div class="right-header__actions">
           <button class="btn btn--tiny" id="btn-clear-console" title="Limpiar consola">⌫</button>
           <button class="btn btn--tiny btn--dl" id="btn-dl-output"  disabled title="Descargar salida">↓ salida</button>
+          <button class="btn btn--tiny btn--dl" id="btn-dl-arm64"   disabled title="Descargar ARM64">↓ ARM64</button>
           <button class="btn btn--tiny btn--dl" id="btn-dl-errors"  disabled title="Descargar errores">↓ errores</button>
           <button class="btn btn--tiny btn--dl" id="btn-dl-symbols" disabled title="Descargar símbolos">↓ símbolos</button>
         </div>
@@ -113,6 +119,14 @@
             <tbody id="errors-tbody"></tbody>
           </table>
         </div>
+      </div>
+
+      <!-- Vista: ARM64 -->
+      <div class="right-view" id="view-arm64">
+        <div class="report-placeholder" id="arm64-placeholder">
+          <span>// El código ARM64 generado aparecerá aquí después de compilar.</span>
+        </div>
+        <pre class="arm64-code" id="arm64-code" hidden></pre>
       </div>
 
       <!-- Vista: Símbolos -->

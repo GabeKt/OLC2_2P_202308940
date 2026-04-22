@@ -13,6 +13,9 @@ const btnRun          = document.getElementById('btn-run');
 const btnClearConsole = document.getElementById('btn-clear-console');
 const fileInput       = document.getElementById('file-input');
 const btnDlErrors     = document.getElementById('btn-dl-errors');
+const btnDlArm64      = document.getElementById('btn-dl-arm64');
+const arm64Placeholder = document.getElementById('arm64-placeholder');
+const arm64Code        = document.getElementById('arm64-code');
 const btnDlSymbols    = document.getElementById('btn-dl-symbols');
 const btnDlOutput     = document.getElementById('btn-dl-output');
 const badgeErrors     = document.getElementById('badge-errors');
@@ -137,6 +140,17 @@ function renderSymbols(symbols) {
   }).join('');
 }
 
+function renderArm64(code) {
+  if (!code || !code.trim()) {
+    arm64Placeholder.hidden = false;
+    arm64Code.hidden = true;
+    return;
+  }
+  arm64Placeholder.hidden = true;
+  arm64Code.hidden = false;
+  arm64Code.textContent = code;
+}
+
 function resetReports() {
   badgeErrors.textContent  = '0'; badgeErrors.className  = 'view-tab__badge';
   badgeSymbols.textContent = '0'; badgeSymbols.className = 'view-tab__badge';
@@ -144,7 +158,8 @@ function resetReports() {
   errorsPlaceholder.innerHTML = '<span>// Ejecuta el código para ver los errores.</span>';
   symbolsTable.hidden = true; symbolsPlaceholder.hidden = false;
   symbolsPlaceholder.innerHTML = '<span>// Ejecuta el código para ver la tabla de símbolos.</span>';
-  [btnDlErrors, btnDlSymbols, btnDlOutput].forEach(b => b.disabled = true);
+  [btnDlErrors, btnDlSymbols, btnDlOutput, btnDlArm64].forEach(b => b.disabled = true);
+  arm64Placeholder.hidden = false; arm64Code.hidden = true; arm64Code.textContent = '';
   lastResult = null;
 }
 
@@ -177,6 +192,7 @@ td{padding:8px 14px;border-bottom:1px solid #1a1e26}tr:hover td{background:#1316
 btnDlErrors.addEventListener('click',  () => { if (lastResult) { dl('errores.html',  errorsHtml(lastResult.errors??[]),   'text/html'); showToast('Errores exportados','ok'); }});
 btnDlSymbols.addEventListener('click', () => { if (lastResult) { dl('simbolos.html', symbolsHtml(lastResult.symbols??[]), 'text/html'); showToast('Símbolos exportados','ok'); }});
 btnDlOutput.addEventListener('click',  () => { if (lastResult) { dl('salida.txt', lastResult.output??''); showToast('Salida exportada','ok'); }});
+btnDlArm64.addEventListener('click',   () => { if (lastResult) { dl('program.s', lastResult.arm64??''); showToast('ARM64 exportado','ok'); }});
 
 // ── Toolbar ───────────────────────────────────────────────────────────
 btnNew.addEventListener('click', () => {
@@ -236,7 +252,8 @@ btnRun.addEventListener('click', async () => {
 
     renderErrors(result.errors ?? []);
     renderSymbols(result.symbols ?? []);
-    [btnDlErrors, btnDlSymbols, btnDlOutput].forEach(b => b.disabled = false);
+    renderArm64(result.arm64 ?? '');
+    [btnDlErrors, btnDlSymbols, btnDlOutput, btnDlArm64].forEach(b => b.disabled = false);
 
     result.success ? showToast('Compilación exitosa', 'ok') : showToast(`${result.errors?.length ?? 0} error(es)`, 'err');
 
