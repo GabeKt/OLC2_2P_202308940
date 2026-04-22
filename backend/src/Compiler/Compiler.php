@@ -115,21 +115,45 @@ class Compiler
             'symbols' => $this->buildSymbolTable($symbolTable),
         ];
 
-        // ── Ejecutar ──────────────────────────────────────────────────────────
-        $interpreter = new Interpreter($symbolTable);
-        $interpreter->run($tree);
+    }
 
-        // Leer valores finales del Environment (runtime) y volcarlos al SymbolTable
-        $globalValues = $interpreter->getEnv()->getGlobalValues();
-        foreach ($globalValues as $name => $value) {
-            $symbolTable->setValue($name, $value);
+    // Pipeline: ensamblar, enlazar y ejecutar el código ARM64 generado
+
+    private function assembleAndRun(string $arm64Code): array {
+        $tmpDir = sys_get_temp_dir() . '/golampi_' . uniqid();
+        @mkdir($tmpDir, 0755, true);
+
+        $asmFile = "$tmpDir/program.s";
+        $objFile = "$tmpDir/program.o";
+        $exeFile = "$tmpDir/program";
+
+        file_put_contents($asmFile, $arm64Code);
+
+        // Ensamblar ---------------------------------------------
+        $cmd = "aarch64-linux-gnu-as -o " . escapeshellarg($objFile)
+             . " " . escapeshellarg($asmFile) . " 2>&1";
+        $asOut = shell_exec($cmd);
+        if (!file_exists($objFile)) {
+            $this->cleanup($tmpDir);
+            return ['output' => "Error de ensamblado:\n$asOut", 'error' => true];
         }
 
-        return [
-            'output'  => $interpreter->getOutput(),
-            'errors'  => [],
-            'symbols' => $this->buildSymbolTable($symbolTable),
-        ];
+        // Enlazar
+        $cmd = "aarch64-linux-gnu-ld -o " . escapeshellarg($exeFile)
+             . " " . escapeshellarg($objFile) . " 2>&1";
+        $ldOut = shell_exec($cmd);
+        if (!file_exists($exeFile)) {
+            $this->cleanup($tmpDir);
+            return ['output' => "Error de enlazado:\n$ldOut", 'error' => true];
+        }
+
+        // Ejecutar con QEMU (timeout 10s)
+        $cmd    = "timeout 10 qemu-aarch64 " . escapeshellarg($exeFile) . " 2>&1";
+        $output = shell_exec($cmd);
+        if ($output === null) $output = '';
+
+        $this->cleanup($tmpDir);
+        return ['output' => $output, 'error' => false];
     }
 
     private function buildSymbolTable(SymbolTable $symbolTable): array
