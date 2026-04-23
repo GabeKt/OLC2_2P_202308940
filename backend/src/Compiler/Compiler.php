@@ -16,6 +16,11 @@ use Visitor\CodeGenerator;
 
 class Compiler
 {
+    /**
+     * Compila el código fuente.
+     * @return array{output:string, arm64:string, execution_output:string, errors:array, symbols:array}
+     */
+
     public function compile(string $input): array
     {
         $errorReporter = new ErrorReporter();
@@ -35,28 +40,28 @@ class Compiler
 
         $tree = $parser->program();
 
-        // ── Pasada 1: registrar funciones (hoisting) ──────────────────────────
+        //  Pasada 1: registrar funciones (hoisting) 
         $functionCollector = new FunctionCollector($symbolTable, $errorReporter);
         $functionCollector->visit($tree);
 
-        // ── Pasada 2a: registrar constantes ───────────────────────────────────
+        //  Pasada 2a: registrar constantes 
         $constantCollector = new ConstantCollector($symbolTable, $errorReporter);
         $constantCollector->visit($tree);
 
-        // ── Pasada 2b: registrar variables e inferir tipos ────────────────────
+        //  Pasada 2b: registrar variables e inferir tipos 
         $variableCollector = new VariableCollector($symbolTable, $errorReporter, $typeChecker);
         $variableCollector->visit($tree);
 
-        // ── Pasada 3: validar asignaciones ────────────────────────────────────
+        //  Pasada 3: validar asignaciones 
         $assignmentChecker = new AssignmentChecker($symbolTable, $errorReporter);
         $assignmentChecker->visit($tree);
 
-        // ── Pasada 4: verificar tipos ─────────────────────────────────────────
+        //  Pasada 4: verificar tipos 
         $typeChecker = new TypeChecker($symbolTable, $errorReporter);
         $typeChecker->setFullPass(true);
         $typeChecker->visit($tree);
 
-        // ── Verificar existencia de main ──────────────────────────────────────
+        //  Verificar existencia de main 
         if (!$functionCollector->hasMainFunction()) {
             $errorReporter->add(new \Error\CompilerError(
                 "Error Semántico",
@@ -65,7 +70,7 @@ class Compiler
             ));
         }
 
-        // ── Serializar errores ────────────────────────────────────────────────
+        // Serializar errores 
         $errors = [];
         foreach ($errorReporter->getErrors() as $error) {
             $errors[] = [
@@ -78,28 +83,29 @@ class Compiler
 
         if ($errorReporter->hasErrors()) {
             return [
-                'output'  => '',
-                'arm64'   => '', 
+                'output'           => '',
+                'arm64'            => '',
                 'execution_output' => '',
-                'errors'  => $errors,
-                'symbols' => $this->buildSymbolTable($symbolTable),
+                'errors'           => $errors,
+                'symbols'          => $this->buildSymbolTable($symbolTable),
             ];
         }
 
-        // ── Pasada 5: calcular offsets para variables locales ─────────────────
-        $offsetCalculator = new OffsetCalculator($symbolTable);
-        $offsetCalculator->visit($tree);
+        // Pasada 5: calcular offsets de stack 
+        $offsetCalc = new OffsetCalculator($symbolTable);
+        $offsetCalc->visit($tree);
 
-        // ── Pasada 6: generar código ensamblador ───────────────────────────────
-        $codeGenerator = new CodeGenerator($symbolTable);
-        $codeGenerator->visit($tree);
-        $codeGenerator->emitRuntimeHelpers();
-        $arm64Code = $codeGenerator->getAssembly();
+        // Pasada 6: generar código ARM64 
+        $codeGen = new CodeGenerator($symbolTable);
+        $codeGen->visit($tree);
+        $codeGen->emitRuntimeHelpers();
+        $arm64Code = $codeGen->getAssembly();
 
-        // ── Pasada 7: ejecutar código ARM64 ────────────────────────────────────
-        $execResult = $this->executeArm64($arm64Code);
+        //  Pasada 7: ensamblar, enlazar y ejecutar con QEMU 
+        $execResult = $this->assembleAndRun($arm64Code);
 
-        // Leer valores finales del Environment (runtime)
+        // ------ Leer valores finales del Environment del intérprete --------------------
+        // (también ejecutamos el intérprete para obtener valores de tabla de símbolos)
         $interpreter = new Interpreter($symbolTable);
         $interpreter->run($tree);
         $globalValues = $interpreter->getEnv()->getGlobalValues();
@@ -108,19 +114,19 @@ class Compiler
         }
 
         return [
-            'output' => $execResult['output'],
-            'arm64'  => $arm64Code,
+            'output'           => $execResult['output'],
+            'arm64'            => $arm64Code,
             'execution_output' => $execResult['output'],
-            'errors' => [],
-            'symbols' => $this->buildSymbolTable($symbolTable),
+            'errors'           => [],
+            'symbols'          => $this->buildSymbolTable($symbolTable),
         ];
-
     }
 
-    // Pipeline: ensamblar, enlazar y ejecutar el código ARM64 generado
+    // --- Pipeline: ensamblar, enlazar, ejecutar --------------------------
 
-    private function assembleAndRun(string $arm64Code): array {
-        $tmpDir = sys_get_temp_dir() . '/golampi_' . uniqid();
+    private function assembleAndRun(string $arm64Code): array
+    {
+        $tmpDir  = sys_get_temp_dir() . '/golampi_' . uniqid();
         @mkdir($tmpDir, 0755, true);
 
         $asmFile = "$tmpDir/program.s";
@@ -129,7 +135,7 @@ class Compiler
 
         file_put_contents($asmFile, $arm64Code);
 
-        // Ensamblar ---------------------------------------------
+        // Ensamblar
         $cmd = "aarch64-linux-gnu-as -o " . escapeshellarg($objFile)
              . " " . escapeshellarg($asmFile) . " 2>&1";
         $asOut = shell_exec($cmd);
@@ -156,15 +162,22 @@ class Compiler
         return ['output' => $output, 'error' => false];
     }
 
+    private function cleanup(string $dir): void {
+        array_map('unlink', glob("$dir/*") ?: []);
+        @rmdir($dir);
+    }
+
+    // --- Tabla de símbolos ------------------------------------------------
+
     private function buildSymbolTable(SymbolTable $symbolTable): array
     {
         $rows = [];
 
         foreach ($symbolTable->getVariables() as $name => $info) {
             $val = $info['value'] ?? null;
-            if (is_array($val))      $val = '[' . implode(', ', $val) . ']';
-            elseif (is_bool($val))   $val = $val ? 'true' : 'false';
-            elseif ($val === null)   $val = 'nil';
+            if (is_array($val))    $val = '[' . implode(', ', $val) . ']';
+            elseif (is_bool($val)) $val = $val ? 'true' : 'false';
+            elseif ($val === null) $val = 'nil';
             $rows[] = [
                 'name'  => $name,
                 'kind'  => $info['kind']  ?? 'var',
