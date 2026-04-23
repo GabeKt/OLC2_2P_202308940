@@ -101,7 +101,7 @@ class CodeGenerator extends GrammarBaseVisitor {
         $frameSize = $this->symbolTable->getFunctionFrameSize($funcName);
         $this->currentFunc = $funcName;
 
-        $this->comment("======== Función {$funcName} ========");
+        $this->comment("======== Función $funcName ========");
         $this->emitLabel($funcName);
 
         // Prologo: guardar LR y FP, establecer nuevo FP
@@ -549,10 +549,9 @@ class CodeGenerator extends GrammarBaseVisitor {
 
     private function emitPrintSpace(): void {
         $spLabel = $this->getStringLabel(" ");
-        $this->instr('adrp', 'x0', $spLabel);
-        $this->instr('add',  'x0', 'x0', ":lo12:{$spLabel}");
+        $this->instr('adrp', 'x1', $spLabel);
+        $this->instr('add',  'x1', 'x1', ":lo12:{$spLabel}");
         $this->instr('mov',  'x2', '#1');
-        $this->instr('mov',  'x1', 'x0');
         $this->instr('mov',  'x0', '#1');
         $this->instr('mov',  'x8', '#64');
         $this->instr('svc',  '#0');
@@ -572,15 +571,14 @@ class CodeGenerator extends GrammarBaseVisitor {
 
     // Strings en la sección .data ------------------------------------------------------------
 
-    private function getStringLabel(string $raw): string {
-        if (isset($this->stringLiterals[$raw])) {
-            return $this->stringLiterals[$raw];
+    private function getStringLabel(string $str): string {
+        if (isset($this->stringLiterals[$str])) {
+            return $this->stringLiterals[$str];
         }
-        $label = '__str_' . $this->strLitCount++;
-        $escaped = $this->escapeForAsm($raw);
-        $this->dataSection[] = "{$label}: .ascii \"{$escaped}\"";
-        $this->dataSection[] = "{$label}_len = . - {$label}";
-        $this->stringLiterals[$raw] = $label;
+        $label = $this->newLabel('str');
+        $this->stringLiterals[$str] = $label;
+        $this->dataSection[] = "{$label}: .asciz \"{$str}\"";
+        //$this->dataSection[] = "{$label}_len = . - {$label}";
         return $label;
     }
 
@@ -1106,24 +1104,25 @@ class CodeGenerator extends GrammarBaseVisitor {
 
     private function emitPrintStrHelper(): void {
         $this->emit('');
-        $this->comment('__print_str: imprime string en x0 (hasta null o longitud conocida)');
+        $this->comment('__print_str: imprime string en x0 (null-terminated)');
         $this->emit('__print_str:');
         $this->instr('sub', 'sp', 'sp', '#16');
         $this->instr('stp', 'x29, x30', '[sp, #0]');
 
-        // Calcular strlen
-        $this->instr('mov', 'x1', 'x0');
-        $this->instr('mov', 'x2', '#0');
+        // x0 = dirección del string — calcular longitud
+        $this->instr('mov', 'x19', 'x0');   // guardar base en callee-saved
+        $this->instr('mov', 'x2', '#0');    // contador longitud
         $labelStrLen = $this->newLabel('strlen_loop');
         $this->emitLabel($labelStrLen);
-        $this->instr('ldrb', 'w3', '[x1, x2]');
+        $this->instr('ldrb', 'w3', '[x19, x2]');
         $this->instr('cbz',  'w3', '__print_str_write');
         $this->instr('add',  'x2', 'x2', '#1');
         $this->instr('b', $labelStrLen);
 
         $this->emit('__print_str_write:');
-        $this->instr('mov', 'x0', '#1');
-        $this->instr('mov', 'x8', '#64');
+        $this->instr('mov', 'x1', 'x19');   // dirección base
+        $this->instr('mov', 'x0', '#1');    // stdout
+        $this->instr('mov', 'x8', '#64');   // write syscall
         $this->instr('svc', '#0');
 
         $this->instr('ldp', 'x29, x30', '[sp, #0]');
