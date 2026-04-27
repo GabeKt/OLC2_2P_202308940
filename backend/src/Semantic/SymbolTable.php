@@ -38,10 +38,10 @@ class SymbolTable {
         $globalScope = &$this->scopes[0];
         if (isset($globalScope['functions'][$name])) return false;
         $globalScope['functions'][$name] = [
-            'returnType' => $returnType, 
-            'params' => $params,
-            'frameSize' => 0, // 
-            ];
+            'returnType' => $returnType,
+            'params'     => $params,
+            'frameSize'  => 0,   // calculado por OffsetCalculator
+        ];
         return true;
     }
 
@@ -57,11 +57,23 @@ class SymbolTable {
         return $this->scopes[0]['functions'] ?? [];
     }
 
-    // Funcion auxiliar para actualizar el tamaño del frame de una función (usada al agregar variables locales)
+    /** Actualiza el frameSize de una función (usado por OffsetCalculator). */
     public function setFunctionFrameSize(string $name, int $size): void {
         if (isset($this->scopes[0]['functions'][$name])) {
             $this->scopes[0]['functions'][$name]['frameSize'] = $size;
         }
+    }
+
+    /** Guarda el offset de stack de un parámetro de función. */
+    public function setParamOffset(string $funcName, string $paramName, int $offset): void {
+        if (isset($this->scopes[0]['functions'][$funcName])) {
+            $this->scopes[0]['functions'][$funcName]['paramOffsets'][$paramName] = $offset;
+        }
+    }
+
+    /** Retorna el offset de stack de un parámetro de función, o -1 si no existe. */
+    public function getParamOffset(string $funcName, string $paramName): int {
+        return $this->scopes[0]['functions'][$funcName]['paramOffsets'][$paramName] ?? -1;
     }
 
     public function getFunctionFrameSize(string $name): int {
@@ -69,18 +81,17 @@ class SymbolTable {
     }
 
     //  Variables ------------------------------------------------------------
-    // Firma extendida pero compatible: line y scopeLabel son opcionales
     public function addVariable(string $name, string $type, string $kind = 'var', int $line = 0, ?string $scopeLabel = null): bool {
         $scope = &$this->currentScopeRef();
         if (isset($scope['variables'][$name])) return false;
         $scope['variables'][$name] = [
-            'type'  => $type,
-            'kind'  => $kind,
-            'line'  => $line,
-            'scope' => $scopeLabel ?? $this->currentScopeLabel(),
-            'value' => null,
-            'offset'=> -1, // Offset se asignará durante la generación de código
-            'size'  => $this->typeSize($type),
+            'type'   => $type,
+            'kind'   => $kind,
+            'line'   => $line,
+            'scope'  => $scopeLabel ?? $this->currentScopeLabel(),
+            'value'  => null,
+            'offset' => -1,   // asignado por OffsetCalculator, -1 = global/no asignado
+            'size'   => $this->typeSize($type),
         ];
         return true;
     }
@@ -112,7 +123,8 @@ class SymbolTable {
         }
     }
 
-    public function setOffset(string $name, int $offset): void{
+    /** Asigna offset de stack a una variable en el scope actual. */
+    public function setOffset(string $name, int $offset): void {
         for ($i = count($this->scopes) - 1; $i >= 0; $i--) {
             if (isset($this->scopes[$i]['variables'][$name])) {
                 $this->scopes[$i]['variables'][$name]['offset'] = $offset;
@@ -121,6 +133,7 @@ class SymbolTable {
         }
     }
 
+    /** Devuelve el offset de stack de una variable. */
     public function getOffset(string $name): int {
         $info = $this->lookup($name);
         return $info['offset'] ?? -1;
@@ -137,23 +150,23 @@ class SymbolTable {
         return $all;
     }
 
-    // Tamaño en bytes de tipos primitivos 
-
-    public function typeSize(string $type): int{
-        if (preg_match('/^\[(\d+)\](.+)$/', $type, $match)){
-            return (int)$match[1] * $this->typeSize($match[2]);
+    // Tamaños de tipos ----------------------------------------------
+    public function typeSize(string $type): int {
+        // Arreglos: [N]tipo -> N * typeSize(tipo)
+        if (preg_match('/^\[(\d+)\](.+)$/', $type, $m)) {
+            return (int)$m[1] * $this->typeSize($m[2]);
         }
-
-        return match($type){
+        return match($type) {
             'int32', 'rune', 'bool' => 4,
-            'float32' => 4,
-            'float64' => 8,
-            'string' => 24, // Referencia + longitud (en un sistema de 64 bits)
-            default => 8,
+            'float32'               => 4,
+            'float64'               => 8,
+            'string'                => 16, // puntero(8) + longitud(8)
+            default                 => 8,  // puntero / desconocido
         };
     }
 
-    public static function alignUp(int $value, int $align): int{
+    /** Alinea un valor al múltiplo de $align más cercano hacia arriba. */
+    public static function alignUp(int $value, int $align): int {
         return (int)(ceil($value / $align) * $align);
     }
 }

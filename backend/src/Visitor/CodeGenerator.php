@@ -4,27 +4,36 @@ namespace Visitor;
 use GrammarBaseVisitor;
 use Semantic\SymbolTable;
 
+/**
+ * CodeGenerator — genera código ensamblador ARM64 (AArch64).
+ *
+ * Convenciones:
+ *  - x29 = frame pointer, x30 = link register
+ *  - Parámetros en x0-x7 (enteros/punteros), s0-s7 (float)
+ *  - Variables locales en stack con offset desde sp
+ *  - Strings en sección .data
+ *  - fmt.Println usa syscall write (x8=64) para stdout
+ */
 class CodeGenerator extends GrammarBaseVisitor {
 
-    private SymbolTable $symbolTable; // instancia de la tabla de símbolos para acceder a información de variables y funciones
-    private array $lines = []; // para almacenar las líneas de código ensamblador generadas
-    private array $dataSection = []; // para almacenar variables y strings (sección .data)
-    private int $labelCount = 0; // contador para generar etiquetas únicas
-    private string $currentFun = ''; // para saber en qué función estamos generando código
-    private int $strLitCount = 0; // contador de strings literales
-    private array $stringLiterals = [];
+    private SymbolTable $symbolTable;
+    private array  $lines       = [];   // líneas de código ensamblador
+    private array  $dataSection = [];   // .data strings
+    private int    $labelCount  = 0;    // contador de etiquetas únicas
+    private string $currentFunc = '';   // función actual
+    private int    $strLitCount = 0;    // contador de string literals
+    private array  $stringLiterals = []; // map 'texto' => label
 
-    private array $loopBreakStack = [];
+    // Para loops: pila de etiquetas (break/continue)
+    private array $loopBreakStack    = [];
     private array $loopContinueStack = [];
 
     public function __construct(SymbolTable $symbolTable) {
         $this->symbolTable = $symbolTable;
     }
 
-    // HELPERS --------------------------------------------------------------------------------------------------------------------------------
+    // ── Helpers de emisión ────────────────────────────────────────────────────
 
-
-    // Método auxiliar para agregar una línea de código ensamblador a la salida
     private function emit(string $line): void {
         $this->lines[] = $line;
     }
@@ -41,16 +50,13 @@ class CodeGenerator extends GrammarBaseVisitor {
         $this->lines[] = "    # $text";
     }
 
-    // Para escribir instrucciones con espacios al inicio de instrucciones
     private function instr(string $op, string ...$args): void {
         $operands = implode(', ', $args);
         $this->lines[] = "    {$op} {$operands}";
     }
 
+    // ── Resultado final ───────────────────────────────────────────────────────
 
-    // RESULTADO FINAL  -----------------------------------------------------------
-    
-    
     public function getAssembly(): string {
         $out = [];
 
@@ -80,7 +86,7 @@ class CodeGenerator extends GrammarBaseVisitor {
         return implode("\n", $out) . "\n";
     }
 
-    // PUNTO DE ENTRADA (.start_) -----------------------------------------------------------
+    // ── Programa ──────────────────────────────────────────────────────────────
 
     public function visitProgram($ctx): void {
         // Emitir _start que llama a main y hace exit
@@ -95,35 +101,34 @@ class CodeGenerator extends GrammarBaseVisitor {
         $this->visitChildren($ctx);
     }
 
-    
+    // ── Funciones ─────────────────────────────────────────────────────────────
+
     public function visitFuncDecl($ctx): void {
-        $funcName = $ctx->ID()->getText();
+        $funcName  = $ctx->ID()->getText();
         $frameSize = $this->symbolTable->getFunctionFrameSize($funcName);
         $this->currentFunc = $funcName;
 
-        $this->comment("======== Función $funcName ========");
+        $this->comment("=== función $funcName ===");
         $this->emitLabel($funcName);
 
-        // Prologo: guardar LR y FP, establecer nuevo FP
-        $this->comment('Prologo: reservar frame');
+        // Prólogo
+        $this->comment("prólogo: reservar frame");
         $this->instr('sub', 'sp', 'sp', "#$frameSize");
         $this->instr('stp', 'x29, x30', "[sp, #0]");
         $this->instr('mov', 'x29', 'sp');
 
-        // Guardar parámetros en el stack
+        // Guardar parámetros en el stack (leer offset desde SymbolTable.getParamOffset)
         if ($ctx->paramList() !== null) {
-            $regIdx = 0;
+            $regIdx  = 0;
             $fregIdx = 0;
             foreach ($ctx->paramList()->paramGroup() as $group) {
-                $typeText = $group->typeLiteral() ? $group->typeLiteral()->getText() : 'unknown';
+                $typeText = $group->typeLiteral() ? $group->typeLiteral()->getText() : 'int32';
                 $isFloat  = ($typeText === 'float32' || $typeText === 'float64');
-                $isPtr    = str_starts_with($typeText, '*') || $group->STAR() !== null;
 
-                $ids = $group->ID();
-                foreach ($ids as $idToken) {
+                foreach ($group->ID() as $idToken) {
                     $name   = $idToken->getText();
-                    $offset = $this->symbolTable->getOffset($name);
-                    if ($offset < 0) continue;
+                    $offset = $this->symbolTable->getParamOffset($funcName, $name);
+                    if ($offset < 0) { $regIdx++; continue; }
 
                     if ($isFloat) {
                         $this->instr('str', "s{$fregIdx}", "[sp, #{$offset}]");
@@ -148,18 +153,16 @@ class CodeGenerator extends GrammarBaseVisitor {
         $this->emit('');
 
         $this->currentFunc = '';
-
     }
 
-    // BLOQUE ------------------------------------------------------------
+    // ── Bloque ────────────────────────────────────────────────────────────────
 
-    public function visitBlock($ctx): void{
+    public function visitBlock($ctx): void {
         $this->visitChildren($ctx);
     }
 
-    // DECLARACIONES ------------------------------------------------------------
+    // ── Declaraciones ─────────────────────────────────────────────────────────
 
-    // declaracion de variables
     public function visitVarDecl($ctx): void {
         $ids = $ctx->idList() !== null ? $ctx->idList()->ID() : [];
 
@@ -197,7 +200,6 @@ class CodeGenerator extends GrammarBaseVisitor {
         }
     }
 
-    // declaración de variables cortas con :=
     public function visitShortVarDecl($ctx): void {
         $ids   = $ctx->idList()->ID();
         $exprs = $ctx->expressionList()->expression();
@@ -220,8 +222,6 @@ class CodeGenerator extends GrammarBaseVisitor {
         }
     }
 
-
-    // declaracion de constantes
     public function visitConstDecl($ctx): void {
         $name   = $ctx->ID()->getText();
         $offset = $this->symbolTable->getOffset($name);
@@ -231,7 +231,7 @@ class CodeGenerator extends GrammarBaseVisitor {
         $this->instr('str', 'x0', "[sp, #{$offset}]");
     }
 
-    // ASIGNACIONES ------------------------------------------------------------
+    // ── Asignaciones ──────────────────────────────────────────────────────────
 
     public function visitAssignStmt($ctx): void {
         $lValues = $ctx->lValueList()->lValue();
@@ -272,7 +272,6 @@ class CodeGenerator extends GrammarBaseVisitor {
         }
     }
 
-
     public function visitIncDecStmt($ctx): void {
         $lv     = $ctx->lValue();
         $name   = $lv->ID()->getText();
@@ -285,8 +284,7 @@ class CodeGenerator extends GrammarBaseVisitor {
         $this->instr('str', 'x0', "[sp, #{$offset}]");
     }
 
-    
-    // CONTROL DE FLUJO ------------------------------------------------------------
+    // ── Control de flujo ──────────────────────────────────────────────────────
 
     public function visitIfStmt($ctx): void {
         $labelElse = $this->newLabel('else');
@@ -441,43 +439,54 @@ class CodeGenerator extends GrammarBaseVisitor {
         }
     }
 
-
-    // LLAMADAS A FUNCIONES ------------------------------------------------------------
+    // ── Llamadas a función ────────────────────────────────────────────────────
 
     public function visitFunctionCall($ctx): void {
         $name = $ctx->ID()->getText();
         $args = ($ctx->argumentList() !== null) ? $ctx->argumentList()->argument() : [];
 
-        // Evaluar argumentos y cargarlos en registros
+        // Paso 1: evaluar todos los argumentos y guardarlos en el stack temporalmente
+        // para evitar que la evaluación del arg N sobreescriba el resultado del arg N-1
+        $argCount = count($args);
+        if ($argCount > 0) {
+            $tmpSize = max(16, (int)(ceil($argCount * 8 / 16)) * 16);
+            $this->instr('sub', 'sp', 'sp', "#$tmpSize");
+        }
+
         $regIdx  = 0;
-        $fregIdx = 0;
-        foreach ($args as $arg) {
+        foreach ($args as $i => $arg) {
             if ($arg->AMP() !== null) {
-                // Paso por referencia: calcular dirección
+                // Paso por referencia: calcular dirección (ajustar por el tmp frame)
                 $varName = $arg->ID()->getText();
                 $offset  = $this->symbolTable->getOffset($varName);
-                $this->instr('add', "x{$regIdx}", 'sp', "#$offset");
-                $regIdx++;
+                $adjOffset = $offset + ($argCount > 0 ? max(16, (int)(ceil($argCount * 8 / 16)) * 16) : 0);
+                $this->instr('add', 'x0', 'sp', "#$adjOffset");
             } else {
                 $expr = $arg->expression();
                 $this->visitExprIntoX0($expr);
-                $type = $this->getExprType($expr);
-                if ($type === 'float32') {
-                    if ($regIdx > 0) $this->instr('fmov', "s{$fregIdx}", 's0');
-                    $fregIdx++;
-                } else {
-                    if ($regIdx > 0) $this->instr('mov', "x{$regIdx}", 'x0');
-                    $regIdx++;
-                }
             }
+            // Guardar resultado en slot temporal
+            $tmpOffset = $i * 8;
+            $this->instr('str', 'x0', "[sp, #{$tmpOffset}]");
+            $regIdx++;
+        }
+
+        // Paso 2: cargar desde slots temporales a registros de argumento
+        for ($i = 0; $i < $argCount; $i++) {
+            $this->instr('ldr', "x{$i}", "[sp, #" . ($i * 8) . "]");
+        }
+
+        // Liberar espacio temporal
+        if ($argCount > 0) {
+            $tmpSize = max(16, (int)(ceil($argCount * 8 / 16)) * 16);
+            $this->instr('add', 'sp', 'sp', "#$tmpSize");
         }
 
         $this->instr('bl', $name);
-        // Resultado queda en x0 (o s0 para float)
+        // Resultado queda en x0
     }
 
-
-    // fmt.Println ------------------------------------------------------------
+    // ── fmt.Println ───────────────────────────────────────────────────────────
 
     public function visitFmtPrintln($ctx): void {
         if ($ctx->argumentList() === null) {
@@ -520,8 +529,7 @@ class CodeGenerator extends GrammarBaseVisitor {
         $this->emitPrintNewline();
     }
 
-
-    // HELPERS DE PRINTLN ------------------------------------------------------------
+    // ── Helpers de print (syscall write) ─────────────────────────────────────
 
     private function emitPrintInt(): void {
         // x0 tiene el entero — convertir a string y escribir
@@ -559,26 +567,25 @@ class CodeGenerator extends GrammarBaseVisitor {
 
     private function emitPrintNewline(): void {
         $nlLabel = $this->getStringLabel("\n");
-        $this->instr('adrp', 'x0', $nlLabel);
-        $this->instr('add',  'x0', 'x0', ":lo12:{$nlLabel}");
+        $this->instr('adrp', 'x1', $nlLabel);
+        $this->instr('add',  'x1', 'x1', ":lo12:{$nlLabel}");
         $this->instr('mov',  'x2', '#1');
-        $this->instr('mov',  'x1', 'x0');
         $this->instr('mov',  'x0', '#1');
         $this->instr('mov',  'x8', '#64');
         $this->instr('svc',  '#0');
     }
 
+    // ── Strings en .data ─────────────────────────────────────────────────────
 
-    // Strings en la sección .data ------------------------------------------------------------
-
-    private function getStringLabel(string $str): string {
-        if (isset($this->stringLiterals[$str])) {
-            return $this->stringLiterals[$str];
+    private function getStringLabel(string $raw): string {
+        if (isset($this->stringLiterals[$raw])) {
+            return $this->stringLiterals[$raw];
         }
-        $label = $this->newLabel('str');
-        $this->stringLiterals[$str] = $label;
-        $this->dataSection[] = "{$label}: .asciz \"{$str}\"";
-        //$this->dataSection[] = "{$label}_len = . - {$label}";
+        $label = '__str_' . $this->strLitCount++;
+        $escaped = $this->escapeForAsm($raw);
+        $this->dataSection[] = "{$label}: .ascii \"{$escaped}\"";
+        // .asciz includes null terminator — no need for _len
+        $this->stringLiterals[$raw] = $label;
         return $label;
     }
 
@@ -591,8 +598,7 @@ class CodeGenerator extends GrammarBaseVisitor {
         return $s;
     }
 
-
-    // EVALUACION DE EXPRESIONES ------------------------------------------------------------
+    // ── Evaluación de expresiones → resultado en x0 (o s0 para float) ────────
 
     private function visitExprIntoX0($ctx): void {
         $this->visit($ctx);
@@ -664,7 +670,6 @@ class CodeGenerator extends GrammarBaseVisitor {
         }
     }
 
-
     public function visitComparison($ctx): void {
         $children = $ctx->addition();
         $this->visit($children[0]);
@@ -729,7 +734,6 @@ class CodeGenerator extends GrammarBaseVisitor {
         }
     }
 
-
     public function visitUnary($ctx): void {
         if ($ctx->primaryExpr() !== null) {
             $this->visit($ctx->primaryExpr());
@@ -760,7 +764,6 @@ class CodeGenerator extends GrammarBaseVisitor {
         }
     }
 
-
     public function visitPrimaryExpr($ctx): void {
         if ($ctx->operand() !== null) {
             $this->visit($ctx->operand());
@@ -787,7 +790,6 @@ class CodeGenerator extends GrammarBaseVisitor {
         }
     }
 
-
     public function visitOperand($ctx): void {
         if ($ctx->literal() !== null) {
             $this->visit($ctx->literal());
@@ -813,8 +815,14 @@ class CodeGenerator extends GrammarBaseVisitor {
         if ($ctx->ID() !== null) {
             $name   = $ctx->ID()->getText();
             $offset = $this->symbolTable->getOffset($name);
+            // Si no hay offset local, buscar en parámetros de la función actual
+            if ($offset < 0 && $this->currentFunc !== '') {
+                $offset = $this->symbolTable->getParamOffset($this->currentFunc, $name);
+            }
             if ($offset >= 0) {
-                $type = $this->symbolTable->lookup($name)['type'] ?? 'int32';
+                $info = $this->symbolTable->lookup($name);
+                $type = $info['type'] ?? 'int32';
+                // Si no se encontró en SymbolTable, asumir int32 (es un parámetro)
                 if ($type === 'float32') {
                     $this->instr('ldr', 's0', "[sp, #{$offset}]");
                 } else {
@@ -829,7 +837,6 @@ class CodeGenerator extends GrammarBaseVisitor {
             $this->visitExprIntoX0($ctx->expression());
         }
     }
-
 
     public function visitLiteral($ctx): void {
         if ($ctx->INT_LIT() !== null) {
@@ -874,12 +881,15 @@ class CodeGenerator extends GrammarBaseVisitor {
         }
     }
 
-
-    public function visitArrayLiteral($ctx): void{
-        $this->instr('mov', 'x0', '#0'); // tamaño del arreglo
+    public function visitArrayLiteral($ctx): void {
+        // Arreglos: reservar espacio en stack e inicializar
+        // Para simplificar, usamos una región temporal
+        // En una implementación completa, esto iría en el frame
+        // Por ahora dejamos x0 = 0 como placeholder
+        $this->instr('mov', 'x0', '#0');
     }
 
-    // Built ins funciones enbebidas ------------------------------------------------------------
+    // ── Built-ins ─────────────────────────────────────────────────────────────
 
     public function visitLenCall($ctx): void {
         // len(arr) — para arreglos fijos, el tamaño es conocido en compilación
@@ -911,7 +921,6 @@ class CodeGenerator extends GrammarBaseVisitor {
         // bool/string/rune: x0 ya tiene el valor
     }
 
-
     public function visitNowCall($ctx): void {
         // Retorna string vacío por ahora (requiere libc)
         $label = $this->getStringLabel('');
@@ -927,8 +936,7 @@ class CodeGenerator extends GrammarBaseVisitor {
         $this->instr('add', 'x0', 'x19', 'x0'); // ptr + start
     }
 
-
-    // HELPERS ------------------------------------------------------------
+    // ── Helpers ───────────────────────────────────────────────────────────────
 
     private function getExprType($ctx): string {
         // Intento básico de inferir tipo desde el contexto
@@ -961,7 +969,8 @@ class CodeGenerator extends GrammarBaseVisitor {
         }
     }
 
-    // FUNCIONES AUXILIARES DE RUNTIME ---------------------------------------------
+    // ── Funciones auxiliares de runtime ──────────────────────────────────────
+    // Se emiten al final del archivo .s
 
     public function emitRuntimeHelpers(): void {
         $this->emit('');
@@ -1101,7 +1110,6 @@ class CodeGenerator extends GrammarBaseVisitor {
         $this->instr('ret');
     }
 
-
     private function emitPrintStrHelper(): void {
         $this->emit('');
         $this->comment('__print_str: imprime string en x0 (null-terminated)');
@@ -1129,7 +1137,4 @@ class CodeGenerator extends GrammarBaseVisitor {
         $this->instr('add', 'sp', 'sp', '#16');
         $this->instr('ret');
     }
-
-
 }
-
