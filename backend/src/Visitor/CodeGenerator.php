@@ -141,12 +141,20 @@ class CodeGenerator extends GrammarBaseVisitor {
             }
         }
 
+        // Preservar registros callee-saved que usamos como temporales
+        // x19, x20, x21 se usan en expresiones — guardarlos tras x29/x30
+        $this->comment("preservar x19, x20, x21");
+        $this->instr('stp', 'x19, x20', "[sp, #16]");
+        $this->instr('str', 'x21',      "[sp, #32]");
+
         // Cuerpo
         $this->visit($ctx->block());
 
         // Epílogo (por si no hay return explícito)
         $this->emitLabel("{$funcName}_ret");
-        $this->comment("epílogo");
+        $this->comment("epílogo: restaurar callee-saved");
+        $this->instr('ldp', 'x19, x20', "[sp, #16]");
+        $this->instr('ldr', 'x21',      "[sp, #32]");
         $this->instr('ldp', 'x29, x30', "[sp, #0]");
         $this->instr('add', 'sp', 'sp', "#$frameSize");
         $this->instr('ret');
@@ -444,46 +452,35 @@ class CodeGenerator extends GrammarBaseVisitor {
     public function visitFunctionCall($ctx): void {
         $name = $ctx->ID()->getText();
         $args = ($ctx->argumentList() !== null) ? $ctx->argumentList()->argument() : [];
-
-        // Paso 1: evaluar todos los argumentos y guardarlos en el stack temporalmente
-        // para evitar que la evaluación del arg N sobreescriba el resultado del arg N-1
         $argCount = count($args);
-        if ($argCount > 0) {
-            $tmpSize = max(16, (int)(ceil($argCount * 8 / 16)) * 16);
-            $this->instr('sub', 'sp', 'sp', "#$tmpSize");
-        }
 
-        $regIdx  = 0;
+        // Evaluar cada argumento y moverlo al registro correcto.
+        // Para evitar que la evaluación del arg[i] sobreescriba x19 (que puede
+        // contener el operando izquierdo de una expresión pendiente), usamos
+        // registros x9-x15 como staging area antes de mover a x0-x7.
+        $stagingRegs = ['x9','x10','x11','x12','x13','x14','x15'];
+
         foreach ($args as $i => $arg) {
             if ($arg->AMP() !== null) {
-                // Paso por referencia: calcular dirección (ajustar por el tmp frame)
                 $varName = $arg->ID()->getText();
                 $offset  = $this->symbolTable->getOffset($varName);
-                $adjOffset = $offset + ($argCount > 0 ? max(16, (int)(ceil($argCount * 8 / 16)) * 16) : 0);
-                $this->instr('add', 'x0', 'sp', "#$adjOffset");
+                if ($offset < 0 && $this->currentFunc !== '') {
+                    $offset = $this->symbolTable->getParamOffset($this->currentFunc, $varName);
+                }
+                $this->instr('add', $stagingRegs[$i] ?? 'x9', 'sp', "#$offset");
             } else {
-                $expr = $arg->expression();
-                $this->visitExprIntoX0($expr);
+                $this->visitExprIntoX0($arg->expression());
+                $this->instr('mov', $stagingRegs[$i] ?? 'x9', 'x0');
             }
-            // Guardar resultado en slot temporal
-            $tmpOffset = $i * 8;
-            $this->instr('str', 'x0', "[sp, #{$tmpOffset}]");
-            $regIdx++;
         }
 
-        // Paso 2: cargar desde slots temporales a registros de argumento
+        // Mover de staging a registros de argumento ABI (x0-x7)
         for ($i = 0; $i < $argCount; $i++) {
-            $this->instr('ldr', "x{$i}", "[sp, #" . ($i * 8) . "]");
-        }
-
-        // Liberar espacio temporal
-        if ($argCount > 0) {
-            $tmpSize = max(16, (int)(ceil($argCount * 8 / 16)) * 16);
-            $this->instr('add', 'sp', 'sp', "#$tmpSize");
+            $this->instr('mov', "x{$i}", $stagingRegs[$i] ?? 'x9');
         }
 
         $this->instr('bl', $name);
-        // Resultado queda en x0
+        // Resultado en x0
     }
 
     // ── fmt.Println ───────────────────────────────────────────────────────────
@@ -755,9 +752,7 @@ class CodeGenerator extends GrammarBaseVisitor {
         } elseif ($ctx->MINUS() !== null) {
             $this->instr('neg', 'x0', 'x0');
         } elseif ($ctx->AMP() !== null) {
-            // &var — obtener dirección
-            // El resultado de visit(unary) ya tiene el valor — buscar la dirección
-            // Esto se maneja mejor en operand
+
         } elseif ($ctx->STAR() !== null) {
             // *ptr — desreferenciar
             $this->instr('ldr', 'x0', '[x0]');

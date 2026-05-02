@@ -4,7 +4,21 @@ namespace Visitor;
 use GrammarBaseVisitor;
 use Semantic\SymbolTable;
 
-
+/**
+ * OffsetCalculator — pasada previa a CodeGenerator.
+ *
+ * Recorre funcDecl y asigna un offset de stack a cada variable local.
+ * Respeta alineación de 8 bytes (AArch64 requiere sp alineado a 16).
+ *
+ * Layout del stack frame de una función:
+ *   [sp+0]   x29 (frame pointer)   — 8 bytes
+ *   [sp+8]   x30 (link register)   — 8 bytes
+ *   [sp+16]  parámetro 0 / var 0   — según tipo
+ *   [sp+24]  parámetro 1 / var 1
+ *   ...
+ *
+ * Los offsets se almacenan como desplazamiento POSITIVO desde sp.
+ */
 class OffsetCalculator extends GrammarBaseVisitor {
 
     private SymbolTable $symbolTable;
@@ -19,7 +33,7 @@ class OffsetCalculator extends GrammarBaseVisitor {
     public function visitFuncDecl($ctx): void {
         $funcName = $ctx->ID()->getText();
         $this->currentFunc = $funcName;
-        $this->nextOffset  = 16; // reservar 16 bytes para x29/x30
+        $this->nextOffset  = 40; // 16 para x29/x30 + 24 para x19/x20/x21
 
         // Asignar offsets a parámetros desde el nodo de la gramática
         // (no desde SymbolTable.lookup porque los params viven en scopes temporales)
