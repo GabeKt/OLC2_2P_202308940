@@ -93,7 +93,7 @@ class CodeGenerator extends GrammarBaseVisitor {
         $this->emit('.global _start');
         $this->emit('_start:');
         $this->instr('bl', 'main');
-        $this->instr('mov', 'x0', '#0');
+        $this->loadImmediate('x0', 0);
         $this->instr('mov', 'x8', '#93');   // syscall exit
         $this->instr('svc', '#0');
         $this->emit('');
@@ -106,6 +106,8 @@ class CodeGenerator extends GrammarBaseVisitor {
     public function visitFuncDecl($ctx): void {
         $funcName  = $ctx->ID()->getText();
         $frameSize = $this->symbolTable->getFunctionFrameSize($funcName);
+        // Asegurar alineación a 16 bytes (ABI ARM64)
+        $frameSize = ($frameSize + 15) & ~15;
         $this->currentFunc = $funcName;
 
         $this->comment("=== función $funcName ===");
@@ -192,17 +194,31 @@ class CodeGenerator extends GrammarBaseVisitor {
                     }
                 } else {
                     // Valor por defecto: 0
-                    $this->instr('mov', 'x0', '#0');
+                    $this->loadImmediate('x0', 0);
                     $this->instr('str', 'x0', "[sp, #{$offset}]");
                 }
             }
         } else {
             // Sin inicialización — poner 0
+            // Sin inicialización — valor por defecto según tipo
             foreach ($ids as $idToken) {
                 $name   = $idToken->getText();
                 $offset = $this->symbolTable->getOffset($name);
                 if ($offset < 0) return;
-                $this->instr('mov', 'x0', '#0');
+
+                $type = $this->symbolTable->lookup($name)['type'] ?? 'int32';
+
+                if ($type === 'string') {
+                    // string vacío válido (no NULL)
+                    $label = $this->getStringLabel('');
+                    $this->instr('adrp', 'x0', $label);
+                    $this->instr('add',  'x0', 'x0', ":lo12:{$label}");
+                } elseif ($type === 'bool') {
+                    $this->loadImmediate('x0', 0);
+                } else {
+                    $this->loadImmediate('x0', 0);
+                }
+
                 $this->instr('str', 'x0', "[sp, #{$offset}]");
             }
         }
@@ -458,7 +474,7 @@ class CodeGenerator extends GrammarBaseVisitor {
         // Para evitar que la evaluación del arg[i] sobreescriba x19 (que puede
         // contener el operando izquierdo de una expresión pendiente), usamos
         // registros x9-x15 como staging area antes de mover a x0-x7.
-        $stagingRegs = ['x9','x10','x11','x12','x13','x14','x15'];
+        $stagingRegs = ['x9','x10','x11','x12','x13','x14','x15','x16'];
 
         foreach ($args as $i => $arg) {
             if ($arg->AMP() !== null) {
@@ -553,9 +569,12 @@ class CodeGenerator extends GrammarBaseVisitor {
     }
 
     private function emitPrintSpace(): void {
-        $spLabel = $this->getStringLabel(" ");
-        $this->instr('adrp', 'x1', $spLabel);
-        $this->instr('add',  'x1', 'x1', ":lo12:{$spLabel}");
+        if (!isset($this->stringLiterals[" "])) {
+            $this->dataSection[] = '__rt_sp: .asciz " "';
+            $this->stringLiterals[" "] = '__rt_sp';
+        }
+        $this->instr('adrp', 'x1', '__rt_sp');
+        $this->instr('add',  'x1', 'x1', ':lo12:__rt_sp');
         $this->instr('mov',  'x2', '#1');
         $this->instr('mov',  'x0', '#1');
         $this->instr('mov',  'x8', '#64');
@@ -563,9 +582,12 @@ class CodeGenerator extends GrammarBaseVisitor {
     }
 
     private function emitPrintNewline(): void {
-        $nlLabel = $this->getStringLabel("\n");
-        $this->instr('adrp', 'x1', $nlLabel);
-        $this->instr('add',  'x1', 'x1', ":lo12:{$nlLabel}");
+        if (!isset($this->stringLiterals["\n"])) {
+            $this->dataSection[] = '__rt_nl: .asciz "\\n"';
+            $this->stringLiterals["\n"] = '__rt_nl';
+        }
+        $this->instr('adrp', 'x1', '__rt_nl');
+        $this->instr('add',  'x1', 'x1', ':lo12:__rt_nl');
         $this->instr('mov',  'x2', '#1');
         $this->instr('mov',  'x0', '#1');
         $this->instr('mov',  'x8', '#64');
@@ -580,7 +602,7 @@ class CodeGenerator extends GrammarBaseVisitor {
         }
         $label = '__str_' . $this->strLitCount++;
         $escaped = $this->escapeForAsm($raw);
-        $this->dataSection[] = "{$label}: .ascii \"{$escaped}\"";
+        $this->dataSection[] = "{$label}: .asciz \"{$escaped}\"";
         // .asciz includes null terminator — no need for _len
         $this->stringLiterals[$raw] = $label;
         return $label;
@@ -622,7 +644,7 @@ class CodeGenerator extends GrammarBaseVisitor {
         $this->instr('cmp', 'x0', '#0');
         $this->instr('b.eq', $labelEnd);
         $this->emitLabel($labelTrue);
-        $this->instr('mov', 'x0', '#1');
+        $this->loadImmediate('x0', 1);
         $this->emitLabel($labelEnd);
     }
 
@@ -642,7 +664,7 @@ class CodeGenerator extends GrammarBaseVisitor {
         $this->instr('cmp', 'x0', '#0');
         $this->instr('b.ne', $labelEnd);
         $this->emitLabel($labelFalse);
-        $this->instr('mov', 'x0', '#0');
+        $this->loadImmediate('x0', 0);
         $this->emitLabel($labelEnd);
     }
 
@@ -659,10 +681,10 @@ class CodeGenerator extends GrammarBaseVisitor {
             $labelT = $this->newLabel('eq_t');
             $labelE = $this->newLabel('eq_e');
             $this->instr($op === '==' ? 'b.eq' : 'b.ne', $labelT);
-            $this->instr('mov', 'x0', '#0');
+            $this->loadImmediate('x0', 0);
             $this->instr('b', $labelE);
             $this->emitLabel($labelT);
-            $this->instr('mov', 'x0', '#1');
+            $this->loadImmediate('x0', 1);
             $this->emitLabel($labelE);
         }
     }
@@ -687,10 +709,10 @@ class CodeGenerator extends GrammarBaseVisitor {
                 default => 'b.eq',
             };
             $this->instr($branch, $labelT);
-            $this->instr('mov', 'x0', '#0');
+            $this->loadImmediate('x0', 0);
             $this->instr('b', $labelE);
             $this->emitLabel($labelT);
-            $this->instr('mov', 'x0', '#1');
+            $this->loadImmediate('x0', 1);
             $this->emitLabel($labelE);
         }
     }
@@ -701,8 +723,12 @@ class CodeGenerator extends GrammarBaseVisitor {
         if (count($children) === 1) return;
 
         for ($i = 1; $i < count($children); $i++) {
-            $this->instr('mov', 'x19', 'x0');
+            // Guardar operando izquierdo en stack para evitar clobber por expresiones anidadas
+            $this->instr('sub', 'sp', 'sp', '#16');
+            $this->instr('str', 'x0', '[sp, #0]');
             $this->visit($children[$i]);
+            $this->instr('ldr', 'x19', '[sp, #0]');
+            $this->instr('add', 'sp', 'sp', '#16');
             $op = $ctx->getChild($i * 2 - 1)->getText();
             $this->instr($op === '+' ? 'add' : 'sub', 'x0', 'x19', 'x0');
         }
@@ -714,18 +740,33 @@ class CodeGenerator extends GrammarBaseVisitor {
         if (count($children) === 1) return;
 
         for ($i = 1; $i < count($children); $i++) {
-            $this->instr('mov', 'x19', 'x0');
+            // Guardar operando izquierdo en stack para evitar clobber
+            $this->instr('sub', 'sp', 'sp', '#16');
+            $this->instr('str', 'x0', '[sp, #0]');
             $this->visit($children[$i]);
+            $this->instr('ldr', 'x19', '[sp, #0]');
+            $this->instr('add', 'sp', 'sp', '#16');
             $op = $ctx->getChild($i * 2 - 1)->getText();
             switch ($op) {
                 case '*': $this->instr('mul', 'x0', 'x19', 'x0'); break;
-                case '/': $this->instr('sdiv', 'x0', 'x19', 'x0'); break;
+                case '/':
+                    $labelOk = $this->newLabel('div_ok');
+                    $this->instr('cmp', 'x0', '#0');
+                    $this->instr('b.ne', $labelOk);
+                    $this->loadImmediate('x0', 0); // fallback
+                    $this->instr('b', $labelOk);
+                    $this->emitLabel($labelOk);
+                    $this->instr('sdiv', 'x0', 'x19', 'x0');
+                    break;
                 case '%':
-                    // a % b = a - (a/b)*b
-                    $this->instr('mov', 'x20', 'x0'); // b
-                    $this->instr('sdiv', 'x21', 'x19', 'x20');
-                    $this->instr('mul',  'x21', 'x21', 'x20');
-                    $this->instr('sub',  'x0',  'x19', 'x21');
+                    $this->instr('sub', 'sp', 'sp', '#16');
+                    $this->instr('str', 'x0', '[sp, #0]');   // guardar b
+                    
+                    $this->instr('sdiv', 'x0', 'x19', 'x0');  // a/b
+                    $this->instr('ldr', 'x20', '[sp, #0]');  // b
+                    $this->instr('add', 'sp', 'sp', '#16');
+                    $this->instr('mul',  'x0', 'x0', 'x20');   // (a/b)*b
+                    $this->instr('sub',  'x0', 'x19', 'x0');   // a - (a/b)*b
                     break;
             }
         }
@@ -744,15 +785,17 @@ class CodeGenerator extends GrammarBaseVisitor {
             $labelT = $this->newLabel('not_t');
             $labelE = $this->newLabel('not_e');
             $this->instr('b.eq', $labelT);
-            $this->instr('mov', 'x0', '#0');
+            $this->loadImmediate('x0', 0);
             $this->instr('b', $labelE);
             $this->emitLabel($labelT);
-            $this->instr('mov', 'x0', '#1');
+            $this->loadImmediate('x0', 1);
             $this->emitLabel($labelE);
         } elseif ($ctx->MINUS() !== null) {
             $this->instr('neg', 'x0', 'x0');
         } elseif ($ctx->AMP() !== null) {
-
+            // &var — obtener dirección
+            // El resultado de visit(unary) ya tiene el valor — buscar la dirección
+            // Esto se maneja mejor en operand
         } elseif ($ctx->STAR() !== null) {
             // *ptr — desreferenciar
             $this->instr('ldr', 'x0', '[x0]');
@@ -791,7 +834,7 @@ class CodeGenerator extends GrammarBaseVisitor {
             return;
         }
         if ($ctx->NIL() !== null) {
-            $this->instr('mov', 'x0', '#0');
+            $this->loadImmediate('x0', 0);
             return;
         }
         if ($ctx->AMP() !== null && $ctx->ID() !== null) {
@@ -824,7 +867,7 @@ class CodeGenerator extends GrammarBaseVisitor {
                     $this->instr('ldr', 'x0', "[sp, #{$offset}]");
                 }
             } else {
-                $this->instr('mov', 'x0', '#0');
+                $this->loadImmediate('x0', 0);
             }
             return;
         }
@@ -836,14 +879,14 @@ class CodeGenerator extends GrammarBaseVisitor {
     public function visitLiteral($ctx): void {
         if ($ctx->INT_LIT() !== null) {
             $val = (int)$ctx->INT_LIT()->getText();
-            $this->instr('mov', 'x0', "#$val");
+            $this->loadImmediate('x0', $val);
             return;
         }
         if ($ctx->FLOAT_LIT() !== null) {
             $val = $ctx->FLOAT_LIT()->getText();
             // Cargar float como bits en registro general, luego mover a s0
             $bits = unpack('L', pack('f', (float)$val))[1];
-            $this->instr('mov', 'w0', "#$bits");
+            $this->instr('ldr', 'w0', "=$bits");
             $this->instr('fmov', 's0', 'w0');
             return;
         }
@@ -857,18 +900,18 @@ class CodeGenerator extends GrammarBaseVisitor {
             return;
         }
         if ($ctx->TRUE() !== null) {
-            $this->instr('mov', 'x0', '#1');
+            $this->loadImmediate('x0', 1);
             return;
         }
         if ($ctx->FALSE() !== null) {
-            $this->instr('mov', 'x0', '#0');
+            $this->loadImmediate('x0', 0);
             return;
         }
         if ($ctx->RUNE_LIT() !== null) {
             $raw  = $ctx->RUNE_LIT()->getText();
             $char = substr($raw, 1, -1);
             $val  = strlen($char) === 1 ? ord($char) : ord(stripcslashes($char));
-            $this->instr('mov', 'x0', "#$val");
+            $this->loadImmediate('x0', $val);
             return;
         }
         if ($ctx->arrayLiteral() !== null) {
@@ -881,7 +924,7 @@ class CodeGenerator extends GrammarBaseVisitor {
         // Para simplificar, usamos una región temporal
         // En una implementación completa, esto iría en el frame
         // Por ahora dejamos x0 = 0 como placeholder
-        $this->instr('mov', 'x0', '#0');
+        $this->loadImmediate('x0', 0);
     }
 
     // ── Built-ins ─────────────────────────────────────────────────────────────
@@ -933,6 +976,15 @@ class CodeGenerator extends GrammarBaseVisitor {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
+    private function loadImmediate(string $reg, int $value): void {
+        if ($value >= -65535 && $value <= 65535) {
+            $this->instr('mov', $reg, "#$value");
+        } else {
+            $this->instr('ldr', $reg, "=$value");
+        }
+    }
+    
+    
     private function getExprType($ctx): string {
         // Intento básico de inferir tipo desde el contexto
         // En una versión completa se usaría el TypeChecker
@@ -966,6 +1018,7 @@ class CodeGenerator extends GrammarBaseVisitor {
 
     // ── Funciones auxiliares de runtime ──────────────────────────────────────
     // Se emiten al final del archivo .s
+    
 
     public function emitRuntimeHelpers(): void {
         $this->emit('');
@@ -980,14 +1033,16 @@ class CodeGenerator extends GrammarBaseVisitor {
         $this->emit('');
         $this->comment('__print_int: imprime x0 como entero decimal');
         $this->emit('__print_int:');
-        $this->instr('sub', 'sp', 'sp', '#32');
+        // Frame: [0]=x29/x30(16) [16]=x19(8) [24]=output_buf(20) [44]=temp_buf(20) -> 64 bytes
+        $this->instr('sub', 'sp', 'sp', '#64');
         $this->instr('stp', 'x29, x30', '[sp, #0]');
         $this->instr('mov', 'x29', 'sp');
+        $this->instr('str', 'x19', '[sp, #16]');   // preservar x19
 
-        // Buffer de 20 bytes en stack
-        $this->instr('add', 'x9', 'sp', '#16');  // buffer
-        $this->instr('mov', 'x10', '#0');          // longitud
-        $this->instr('mov', 'x11', 'x0');          // número
+        // Buffer de salida en sp+24
+        $this->instr('add', 'x9', 'sp', '#24');   // buffer salida
+        $this->instr('mov', 'x10', '#0');           // longitud
+        $this->instr('mov', 'x11', 'x0');           // número
 
         // Manejo de negativos
         $labelPos = $this->newLabel('pi_pos');
@@ -1011,7 +1066,7 @@ class CodeGenerator extends GrammarBaseVisitor {
         $this->emitLabel($labelNotZero);
 
         // Convertir dígitos (en reversa)
-        $this->instr('add', 'x13', 'sp', '#36'); // puntero al final del buffer temp
+        $this->instr('add', 'x13', 'sp', '#44'); // puntero al buffer temporal de dígitos
         $this->instr('mov', 'x14', '#0');          // dígitos escritos
         $labelDigit = $this->newLabel('pi_digit');
         $this->emitLabel($labelDigit);
@@ -1044,14 +1099,15 @@ class CodeGenerator extends GrammarBaseVisitor {
 
         // Escribir
         $this->emit('__pi_write:');
-        $this->instr('add', 'x1', 'sp', '#16');  // dirección buffer
+        $this->instr('add', 'x1', 'sp', '#24');  // dirección buffer
         $this->instr('mov', 'x2', 'x10');          // longitud
-        $this->instr('mov', 'x0', '#1');            // stdout
+        $this->loadImmediate('x0', 1);            // stdout
         $this->instr('mov', 'x8', '#64');           // write
         $this->instr('svc', '#0');
 
+        $this->instr('ldr', 'x19', '[sp, #16]');
         $this->instr('ldp', 'x29, x30', '[sp, #0]');
-        $this->instr('add', 'sp', 'sp', '#32');
+        $this->instr('add', 'sp', 'sp', '#64');
         $this->instr('ret');
     }
 
@@ -1070,14 +1126,22 @@ class CodeGenerator extends GrammarBaseVisitor {
     }
 
     private function emitPrintBoolHelper(): void {
+        // Emitir strings de true/false directamente con labels fijos
+        if (!isset($this->stringLiterals['true'])) {
+            $this->dataSection[] = '__rt_true: .asciz "true"';
+            $this->stringLiterals['true'] = '__rt_true';
+        }
+        if (!isset($this->stringLiterals['false'])) {
+            $this->dataSection[] = '__rt_false: .asciz "false"';
+            $this->stringLiterals['false'] = '__rt_false';
+        }
+
         $this->emit('');
         $this->comment('__print_bool: imprime x0 como true/false');
         $this->emit('__print_bool:');
         $this->instr('sub', 'sp', 'sp', '#16');
         $this->instr('stp', 'x29, x30', '[sp, #0]');
 
-        $trueLabel  = $this->getStringLabel('true');
-        $falseLabel = $this->getStringLabel('false');
         $labelT = $this->newLabel('pb_true');
         $labelE = $this->newLabel('pb_end');
 
@@ -1085,18 +1149,18 @@ class CodeGenerator extends GrammarBaseVisitor {
         $this->instr('b.ne', $labelT);
 
         // false
-        $this->instr('adrp', 'x1', $falseLabel);
-        $this->instr('add',  'x1', 'x1', ":lo12:{$falseLabel}");
+        $this->instr('adrp', 'x1', '__rt_false');
+        $this->instr('add',  'x1', 'x1', ':lo12:__rt_false');
         $this->instr('mov',  'x2', '#5');
         $this->instr('b', $labelE);
 
         $this->emitLabel($labelT);
-        $this->instr('adrp', 'x1', $trueLabel);
-        $this->instr('add',  'x1', 'x1', ":lo12:{$trueLabel}");
+        $this->instr('adrp', 'x1', '__rt_true');
+        $this->instr('add',  'x1', 'x1', ':lo12:__rt_true');
         $this->instr('mov',  'x2', '#4');
 
         $this->emitLabel($labelE);
-        $this->instr('mov', 'x0', '#1');
+        $this->loadImmediate('x0', 1);
         $this->instr('mov', 'x8', '#64');
         $this->instr('svc', '#0');
 
@@ -1109,27 +1173,34 @@ class CodeGenerator extends GrammarBaseVisitor {
         $this->emit('');
         $this->comment('__print_str: imprime string en x0 (null-terminated)');
         $this->emit('__print_str:');
-        $this->instr('sub', 'sp', 'sp', '#16');
-        $this->instr('stp', 'x29, x30', '[sp, #0]');
 
-        // x0 = dirección del string — calcular longitud
-        $this->instr('mov', 'x19', 'x0');   // guardar base en callee-saved
-        $this->instr('mov', 'x2', '#0');    // contador longitud
+        // Reservar stack (32 bytes alineados)
+        $this->instr('sub', 'sp', 'sp', '#32');
+        $this->instr('stp', 'x29, x30', '[sp, #0]');
+        $this->instr('str', 'x19', '[sp, #16]');
+
+        // x0 = puntero string
+        $this->instr('mov', 'x19', 'x0');   // guardar base
+        $this->instr('mov', 'x2', '#0');    // longitud
+
         $labelStrLen = $this->newLabel('strlen_loop');
         $this->emitLabel($labelStrLen);
+
         $this->instr('ldrb', 'w3', '[x19, x2]');
         $this->instr('cbz',  'w3', '__print_str_write');
         $this->instr('add',  'x2', 'x2', '#1');
         $this->instr('b', $labelStrLen);
 
         $this->emit('__print_str_write:');
-        $this->instr('mov', 'x1', 'x19');   // dirección base
-        $this->instr('mov', 'x0', '#1');    // stdout
-        $this->instr('mov', 'x8', '#64');   // write syscall
+        $this->instr('mov', 'x1', 'x19');   // buffer
+        $this->loadImmediate('x0', 1);      // stdout
+        $this->instr('mov', 'x8', '#64');   // write
         $this->instr('svc', '#0');
 
+        // Restaurar registros
+        $this->instr('ldr', 'x19', '[sp, #16]');
         $this->instr('ldp', 'x29, x30', '[sp, #0]');
-        $this->instr('add', 'sp', 'sp', '#16');
+        $this->instr('add', 'sp', 'sp', '#32');
         $this->instr('ret');
     }
 }
