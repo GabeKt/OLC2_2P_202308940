@@ -517,6 +517,14 @@ class CodeGenerator extends GrammarBaseVisitor {
 
             $expr = $arg->expression();
             $type = $this->getExprType($expr);
+
+            if ($type === 'nil') {
+                $label = $this->getStringLabel('<nil>');
+                $this->instr('adrp', 'x0', $label);
+                $this->instr('add',  'x0', 'x0', ":lo12:{$label}");
+                $this->emitPrintString();
+                continue;
+            }
             $this->visitExprIntoX0($expr);
 
             switch ($type) {
@@ -531,6 +539,12 @@ class CodeGenerator extends GrammarBaseVisitor {
                     $this->emitPrintBool();
                     break;
                 case 'string':
+                    $this->emitPrintString();
+                    break;
+                case 'nil':
+                    $label = $this->getStringLabel('<nil>');
+                    $this->instr('adrp', 'x0', $label);
+                    $this->instr('add',  'x0', 'x0', ":lo12:{$label}");
                     $this->emitPrintString();
                     break;
                 default:
@@ -989,6 +1003,7 @@ class CodeGenerator extends GrammarBaseVisitor {
         if ($ctx === null) return 'int32';
 
         $text = $ctx->getText();
+        
 
         // Literal float directo
         if (preg_match('/^\d+\.\d*$/', $text) || preg_match('/^\.\d+$/', $text)) return 'float32';
@@ -998,6 +1013,10 @@ class CodeGenerator extends GrammarBaseVisitor {
         if ($text === 'true' || $text === 'false') return 'bool';
         // Nil
         if ($text === 'nil') return 'nil';
+        if (preg_match("/^'.*'$/u", $text)) return 'rune';
+
+
+        if (str_contains($text, 'nil')) return 'nil';
 
         // Variable o parámetro conocido (solo si el texto es un identificador simple)
         if (preg_match('/^[a-zA-Z_][a-zA-Z0-9_]*$/', $text)) {
@@ -1021,6 +1040,7 @@ class CodeGenerator extends GrammarBaseVisitor {
         if (str_contains($text, '&&') || str_contains($text, '||') || str_starts_with($text, '!')) return 'bool';
         // Comparaciones -> bool
         if (preg_match('/[<>]=?|==|!=/', $text)) return 'bool';
+        if (preg_match('/&&|\|\||^!/', $text)) return 'bool';
         // Rune literal
         if (preg_match("/^'.*'$/", $text)) return 'rune';
 
@@ -1134,18 +1154,130 @@ class CodeGenerator extends GrammarBaseVisitor {
 
     private function emitPrintFloatHelper(): void {
         $this->emit('');
-        $this->comment('__print_float: imprime s0 como float');
+        $this->comment('__print_float: imprime s0 como decimal');
         $this->emit('__print_float:');
-        $this->instr('sub', 'sp', 'sp', '#16');
+        // Frame: [0]=x29/x30, [16]=x19/x20, [32]=x21, [40]=s0 guardado
+        $this->instr('sub', 'sp', 'sp', '#48');
         $this->instr('stp', 'x29, x30', '[sp, #0]');
-        // Convertir float a int y imprimir (simplificado: solo parte entera)
-        $this->instr('fcvtzs', 'x0', 's0');
+        $this->instr('stp', 'x19, x20', '[sp, #16]');
+        $this->instr('str', 'x21',      '[sp, #32]');
+        $this->instr('mov', 'x29', 'sp');
+
+        // Manejar negativos
+        $labelPos = $this->newLabel('pf_pos');
+        $this->instr('fmov',  'w19', 's0');         // bits de s0 en w19
+        $this->instr('lsr',   'w19', 'w19', '#31'); // bit signo
+        $this->instr('cbz',   'w19', $labelPos);
+        $this->instr('fneg',  's0', 's0');
+        // imprimir '-'
+        $this->instr('sub',  'sp', 'sp', '#16');
+        $this->instr('mov',  'w0', '#45');
+        $this->instr('strb', 'w0', '[sp]');
+        $this->instr('mov',  'x1', 'sp');
+        $this->instr('mov',  'x2', '#1');
+        $this->instr('mov',  'x0', '#1');
+        $this->instr('mov',  'x8', '#64');
+        $this->instr('svc',  '#0');
+        $this->instr('add',  'sp', 'sp', '#16');
+        $this->emitLabel($labelPos);
+
+        // Guardar s0 original
+        $this->instr('str', 's0', '[sp, #40]');
+
+        // --- Parte entera ---
+        $this->instr('fcvtzs', 'x19', 's0');        // x19 = floor(s0)
+        $this->instr('mov', 'x0', 'x19');
         $this->instr('bl', '__print_int');
+
+        // imprimir '.'
+        $this->instr('sub',  'sp', 'sp', '#16');
+        $this->instr('mov',  'w0', '#46');
+        $this->instr('strb', 'w0', '[sp]');
+        $this->instr('mov',  'x1', 'sp');
+        $this->instr('mov',  'x2', '#1');
+        $this->instr('mov',  'x0', '#1');
+        $this->instr('mov',  'x8', '#64');
+        $this->instr('svc',  '#0');
+        $this->instr('add',  'sp', 'sp', '#16');
+
+        // --- Parte fraccionaria ---
+        $this->instr('ldr',   's0', '[sp, #40]');   // restaurar s0
+        $this->instr('scvtf', 's1', 'x19');          // s1 = float(parte_entera)
+        $this->instr('fsub',  's0', 's0', 's1');     // s0 = fracción [0,1)
+
+        // Multiplicar por 1000000 para obtener 6 decimales
+        $this->instr('ldr',    'w0', '=1000000');
+        $this->instr('scvtf',  's1', 'w0');
+        $this->instr('fmul',   's0', 's0', 's1');
+        $this->instr('fcvtzs', 'x20', 's0');         // x20 = dígitos fraccionarios
+
+        // Imprimir 6 dígitos con ceros a la izquierda, eliminar ceros a la derecha
+        // Convertir x20 a string de 6 dígitos
+        $this->instr('mov', 'x0', 'x20');
+        $this->instr('bl', '__print_frac6');
+
+        $this->instr('ldr', 'x21',      '[sp, #32]');
+        $this->instr('ldp', 'x19, x20', '[sp, #16]');
         $this->instr('ldp', 'x29, x30', '[sp, #0]');
-        $this->instr('add', 'sp', 'sp', '#16');
+        $this->instr('add', 'sp', 'sp', '#48');
+        $this->instr('ret');
+
+        // --- Helper __print_frac6: imprime x0 con 6 dígitos, sin ceros finales ---
+        $this->emit('');
+        $this->comment('__print_frac6: imprime x0 como fracción de 6 dígitos sin ceros finales');
+        $this->emit('__print_frac6:');
+        // Frame: [0]=x29/x30, [16]=buf(8 bytes), total=32
+        $this->instr('sub', 'sp', 'sp', '#32');
+        $this->instr('stp', 'x29, x30', '[sp, #0]');
+        $this->instr('mov', 'x29', 'sp');
+
+        // Llenar buffer de 6 caracteres en [sp+16]
+        // x0 = valor (0-999999)
+        // Generamos los 6 dígitos de derecha a izquierda y luego recortamos ceros finales
+        $this->instr('add', 'x9', 'sp', '#16');   // buffer
+        $this->instr('mov', 'x10', '#6');          // contador
+        $this->instr('mov', 'x11', 'x0');          // valor
+
+        $labelFrac = $this->newLabel('frac_digit');
+        $this->emitLabel($labelFrac);
+        $this->instr('cmp', 'x10', '#0');
+        $this->instr('b.eq', '__pf6_trim');
+        $this->instr('mov',  'x12', '#10');
+        $this->instr('udiv', 'x13', 'x11', 'x12');
+        $this->instr('msub', 'x14', 'x13', 'x12', 'x11'); // dígito = x11 % 10
+        $this->instr('add',  'x14', 'x14', '#48');
+        // guardar dígito en posición [x10-1] del buffer
+        $this->instr('sub',  'x15', 'x10', '#1');
+        $this->instr('strb', 'w14', '[x9, x15]');
+        $this->instr('mov',  'x11', 'x13');         // x11 /= 10
+        $this->instr('sub',  'x10', 'x10', '#1');
+        $this->instr('b', $labelFrac);
+
+        // Recortar ceros finales
+        $this->emit('__pf6_trim:');
+        $this->instr('mov', 'x10', '#6');           // longitud inicial
+        $labelTrim = $this->newLabel('pf6_trim_loop');
+        $this->emitLabel($labelTrim);
+        $this->instr('cmp', 'x10', '#1');           // mínimo 1 dígito
+        $this->instr('b.eq', '__pf6_write');
+        $this->instr('sub',  'x15', 'x10', '#1');
+        $this->instr('ldrb', 'w14', '[x9, x15]');
+        $this->instr('cmp',  'w14', '#48');         // '0'
+        $this->instr('b.ne', '__pf6_write');
+        $this->instr('sub',  'x10', 'x10', '#1');
+        $this->instr('b', $labelTrim);
+
+        $this->emit('__pf6_write:');
+        $this->instr('mov', 'x1', 'x9');            // buffer
+        $this->instr('mov', 'x2', 'x10');           // longitud
+        $this->instr('mov', 'x0', '#1');
+        $this->instr('mov', 'x8', '#64');
+        $this->instr('svc', '#0');
+
+        $this->instr('ldp', 'x29, x30', '[sp, #0]');
+        $this->instr('add', 'sp', 'sp', '#32');
         $this->instr('ret');
     }
-
     private function emitPrintBoolHelper(): void {
         // Emitir strings de true/false directamente con labels fijos
         if (!isset($this->stringLiterals['true'])) {
