@@ -986,22 +986,43 @@ class CodeGenerator extends GrammarBaseVisitor {
     
     
     private function getExprType($ctx): string {
-        // Intento básico de inferir tipo desde el contexto
-        // En una versión completa se usaría el TypeChecker
         if ($ctx === null) return 'int32';
 
         $text = $ctx->getText();
 
-        // Literal float
-        if (preg_match('/^\d+\.\d*$/', $text)) return 'float32';
+        // Literal float directo
+        if (preg_match('/^\d+\.\d*$/', $text) || preg_match('/^\.\d+$/', $text)) return 'float32';
         // String literal
         if (str_starts_with($text, '"')) return 'string';
-        // Bool
+        // Bool literal
         if ($text === 'true' || $text === 'false') return 'bool';
+        // Nil
+        if ($text === 'nil') return 'nil';
 
-        // Variable conocida
-        $info = $this->symbolTable->lookup($text);
-        if ($info) return $info['type'];
+        // Variable o parámetro conocido (solo si el texto es un identificador simple)
+        if (preg_match('/^[a-zA-Z_][a-zA-Z0-9_]*$/', $text)) {
+            $info = $this->symbolTable->lookup($text);
+            if ($info) return $info['type'];
+            // Puede ser parámetro de función actual
+            if ($this->currentFunc !== '') {
+                $offset = $this->symbolTable->getParamOffset($this->currentFunc, $text);
+                if ($offset >= 0) {
+                    // Buscar el tipo desde los params de la función
+                    $func = $this->symbolTable->getFunction($this->currentFunc);
+                    foreach ($func['params'] ?? [] as $p) {
+                        if ($p['name'] === $text) return $p['type'];
+                    }
+                }
+            }
+        }
+
+        // Expresiones compuestas: intentar inferir desde operadores
+        // && || ! -> bool
+        if (str_contains($text, '&&') || str_contains($text, '||') || str_starts_with($text, '!')) return 'bool';
+        // Comparaciones -> bool
+        if (preg_match('/[<>]=?|==|!=/', $text)) return 'bool';
+        // Rune literal
+        if (preg_match("/^'.*'$/", $text)) return 'rune';
 
         return 'int32';
     }
