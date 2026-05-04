@@ -453,3 +453,61 @@ ContinueSignal→ capturada en visitForStmt()
 
 ---
 
+## Generacion de Código Ensamblador (ARM64)
+A partir de la fase semántica, el compilador de Golampi genera código ensamblador ARM64 (AArch64) utilizando un Visitor especializado.
+
+Esta funcionalidad transforma el árbol sintáctico en instrucciones de bajo nivel ejecutables en arquitectura ARM.
+
+### Arquitectura de Generación de Código
+El proceso de generación sigue este flujo:
+
+Se recorre el AST con el visitor CodeGenerator
+Se generan instrucciones ensamblador línea por línea
+Se construyen dos secciones:
+.data → almacenamiento de strings
+.text → código ejecutable
+Se agregan funciones auxiliares (runtime)
+Se produce el archivo final .s
+
+### CodeGenerator
+La clase CodeGenerator es responsable de traducir el AST a instrucciones ARM64.
+
+**Responsabilidades**
+- Generar instrucciones ARM64
+- Manejar stack frame de funciones
+- Traducir expresiones y control de flujo
+- Administrar registros
+- Generar labels únicos
+- Construir sección .data para strings
+- Implementar funciones runtime
+
+### Convenciones de ARM64 utilizadas
+El generador sigue convenciones estándar de la arquitectura:
+
+- x0 - x7 → argumentos de funciones
+- x0 → valor de retorno
+- x29 → frame pointer
+- x30 → link register
+- sp → stack pointer
+
+Además:
+
+- x19 - x21 se usan como registros temporales preservados
+- s0 se usa para floats
+
+### Manejo de funciones
+
+Cada función genera:
+
+**Prólogo**
+```
+sub sp, sp, #frameSize
+stp x29, x30, [sp, #0]
+mov x29, sp
+```
+**Epilogo**
+```
+ldp x29, x30, [sp, #0]
+add sp, sp, #frameSize
+ret
+```
