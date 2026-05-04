@@ -76,6 +76,18 @@ class SymbolTable {
         return $this->scopes[0]['functions'][$funcName]['paramOffsets'][$paramName] ?? -1;
     }
 
+    /** Guarda el offset de stack de una variable local de una función específica. */
+    public function setLocalOffset(string $funcName, string $varName, int $offset): void {
+        if (isset($this->scopes[0]['functions'][$funcName])) {
+            $this->scopes[0]['functions'][$funcName]['localOffsets'][$varName] = $offset;
+        }
+    }
+
+    /** Retorna el offset de stack de una variable local de una función, o -1 si no existe. */
+    public function getLocalOffset(string $funcName, string $varName): int {
+        return $this->scopes[0]['functions'][$funcName]['localOffsets'][$varName] ?? -1;
+    }
+
     public function getFunctionFrameSize(string $name): int {
         return $this->scopes[0]['functions'][$name]['frameSize'] ?? 0;
     }

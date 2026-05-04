@@ -4,16 +4,7 @@ namespace Visitor;
 use GrammarBaseVisitor;
 use Semantic\SymbolTable;
 
-/**
- * CodeGenerator — genera código ensamblador ARM64 (AArch64).
- *
- * Convenciones:
- *  - x29 = frame pointer, x30 = link register
- *  - Parámetros en x0-x7 (enteros/punteros), s0-s7 (float)
- *  - Variables locales en stack con offset desde sp
- *  - Strings en sección .data
- *  - fmt.Println usa syscall write (x8=64) para stdout
- */
+
 class CodeGenerator extends GrammarBaseVisitor {
 
     private SymbolTable $symbolTable;
@@ -23,6 +14,8 @@ class CodeGenerator extends GrammarBaseVisitor {
     private string $currentFunc = '';   // función actual
     private int    $strLitCount = 0;    // contador de string literals
     private array  $stringLiterals = []; // map 'texto' => label
+
+    private bool $lastResultWasFloat = false;
 
     // Para loops: pila de etiquetas (break/continue)
     private array $loopBreakStack    = [];
@@ -106,32 +99,59 @@ class CodeGenerator extends GrammarBaseVisitor {
     public function visitFuncDecl($ctx): void {
         $funcName  = $ctx->ID()->getText();
         $frameSize = $this->symbolTable->getFunctionFrameSize($funcName);
-        // Asegurar alineación a 16 bytes (ABI ARM64)
         $frameSize = ($frameSize + 15) & ~15;
+
+        $this->comment("DEBUG frameSize=$funcName: $frameSize");
+        $params = $this->symbolTable->getFunction($funcName)['paramOffsets'] ?? [];
+        foreach ($params as $pname => $poff) {
+            $this->comment("DEBUG param $pname offset=$poff");
+        }
+
         $this->currentFunc = $funcName;
+
+        //debug
+        $params = $this->symbolTable->getFunction($funcName)['paramOffsets'] ?? [];
+        $vars   = $this->symbolTable->getVariables();
+        $this->comment("DEBUG $funcName frameSize=$frameSize");
+        foreach ($params as $pn => $po) {
+            $this->comment("  param $pn = offset $po");
+        }
+
+        $allVars = $this->symbolTable->getVariables();
+        foreach ($allVars as $vname => $vinfo) {
+            if (($vinfo['scope'] ?? '') !== 'global') {
+                $this->comment("  var $vname = offset {$vinfo['offset']} scope={$vinfo['scope']}");
+            }
+        }
 
         $this->comment("=== función $funcName ===");
         $this->emitLabel($funcName);
 
         // Prólogo
-        $this->comment("prólogo: reservar frame");
         $this->instr('sub', 'sp', 'sp', "#$frameSize");
         $this->instr('stp', 'x29, x30', "[sp, #0]");
         $this->instr('mov', 'x29', 'sp');
 
-        // Guardar parámetros en el stack (leer offset desde SymbolTable.getParamOffset)
+        // Preservar callee-saved PRIMERO (antes de tocar params)
+        $this->comment("preservar x19, x20, x21");
+        $this->instr('stp', 'x19, x20', "[sp, #16]");
+        $this->instr('str', 'x21',      "[sp, #32]");
+
+        // Guardar parámetros DESPUÉS (sus offsets ≥ 40, no pisan lo anterior)
         if ($ctx->paramList() !== null) {
             $regIdx  = 0;
             $fregIdx = 0;
             foreach ($ctx->paramList()->paramGroup() as $group) {
                 $typeText = $group->typeLiteral() ? $group->typeLiteral()->getText() : 'int32';
-                $isFloat  = ($typeText === 'float32' || $typeText === 'float64');
+                $isFloat  = ($typeText === 'float32');
 
                 foreach ($group->ID() as $idToken) {
                     $name   = $idToken->getText();
                     $offset = $this->symbolTable->getParamOffset($funcName, $name);
-                    if ($offset < 0) { $regIdx++; continue; }
-
+                    if ($offset < 0) {
+                        if ($isFloat) $fregIdx++; else $regIdx++;
+                        continue;
+                    }
                     if ($isFloat) {
                         $this->instr('str', "s{$fregIdx}", "[sp, #{$offset}]");
                         $fregIdx++;
@@ -143,18 +163,11 @@ class CodeGenerator extends GrammarBaseVisitor {
             }
         }
 
-        // Preservar registros callee-saved que usamos como temporales
-        // x19, x20, x21 se usan en expresiones — guardarlos tras x29/x30
-        $this->comment("preservar x19, x20, x21");
-        $this->instr('stp', 'x19, x20', "[sp, #16]");
-        $this->instr('str', 'x21',      "[sp, #32]");
-
         // Cuerpo
         $this->visit($ctx->block());
 
-        // Epílogo (por si no hay return explícito)
+        // Epílogo
         $this->emitLabel("{$funcName}_ret");
-        $this->comment("epílogo: restaurar callee-saved");
         $this->instr('ldp', 'x19, x20', "[sp, #16]");
         $this->instr('ldr', 'x21',      "[sp, #32]");
         $this->instr('ldp', 'x29, x30', "[sp, #0]");
@@ -180,67 +193,189 @@ class CodeGenerator extends GrammarBaseVisitor {
             $exprs = $ctx->expressionList()->expression();
             foreach ($ids as $i => $idToken) {
                 $name   = $idToken->getText();
-                $offset = $this->symbolTable->getOffset($name);
-                if ($offset < 0) return; // global — no manejamos globals por ahora
+                $offset = $this->resolveOffset($name);
+                if ($offset < 0) continue;
 
                 $expr = $exprs[$i] ?? null;
-                if ($expr !== null) {
+                if ($expr === null) continue;
+
+                if ($this->isArrayLiteralExpr($expr)) {
+                    $this->emitArrayLiteralInit($name, $offset, $expr);
+                } else {
                     $this->visitExprIntoX0($expr);
                     $type = $this->symbolTable->lookup($name)['type'] ?? 'int32';
                     if ($type === 'float32') {
-                        $this->instr('str', 's0', "[sp, #{$offset}]");
+                        $this->instr('str', 's0', "[x29, #{$offset}]");
                     } else {
-                        $this->instr('str', 'x0', "[sp, #{$offset}]");
+                        $this->instr('str', 'x0', "[x29, #{$offset}]");
                     }
-                } else {
-                    // Valor por defecto: 0
-                    $this->loadImmediate('x0', 0);
-                    $this->instr('str', 'x0', "[sp, #{$offset}]");
                 }
             }
         } else {
-            // Sin inicialización — poner 0
             // Sin inicialización — valor por defecto según tipo
             foreach ($ids as $idToken) {
                 $name   = $idToken->getText();
-                $offset = $this->symbolTable->getOffset($name);
-                if ($offset < 0) return;
+                $offset = $this->resolveOffset($name);
+                if ($offset < 0) continue;
 
                 $type = $this->symbolTable->lookup($name)['type'] ?? 'int32';
 
-                if ($type === 'string') {
-                    // string vacío válido (no NULL)
+                if (preg_match('/^\[(\d+)\](.+)$/', $type, $m)) {
+                    // Array: rellenar todos los elementos con 0
+                    $totalSize = $this->symbolTable->typeSize($type);
+                    $this->loadImmediate('x0', 0);
+                    for ($b = 0; $b < $totalSize; $b += 8) {
+                        $this->instr('str', 'x0', "[x29, #" . ($offset + $b) . "]");
+                    }
+                } elseif ($type === 'string') {
                     $label = $this->getStringLabel('');
                     $this->instr('adrp', 'x0', $label);
                     $this->instr('add',  'x0', 'x0', ":lo12:{$label}");
-                } elseif ($type === 'bool') {
-                    $this->loadImmediate('x0', 0);
+                    $this->instr('str', 'x0', "[x29, #{$offset}]");
                 } else {
                     $this->loadImmediate('x0', 0);
+                    $this->instr('str', 'x0', "[x29, #{$offset}]");
                 }
-
-                $this->instr('str', 'x0', "[sp, #{$offset}]");
             }
         }
+    }
+
+    private function isArrayLiteralExpr($exprCtx): bool {
+        // Navegar hasta literal -> arrayLiteral
+        $text = $exprCtx->getText();
+        return preg_match('/^\[\d+\]/', $text) === 1;
+    }
+
+    private function emitArrayLiteralInit(string $name, int $baseOffset, $exprCtx): void {
+        $arrayLit = $this->findArrayLiteral($exprCtx);
+        if ($arrayLit === null) return;
+
+        // Determinar tipo del array desde la tabla de símbolos
+        $info = $this->symbolTable->lookup($name);
+        $arrayType = $info['type'] ?? 'int32';
+
+        $this->emitArrayLiteralElements($baseOffset, $arrayType, $arrayLit->arrayElements());
+
+        // Dejar x0 = dirección base del array
+        $this->instr('add', 'x0', 'x29', "#$baseOffset");
+    }
+
+
+    private function emitArrayLiteralElements(int $baseOffset, string $arrayType, $elementsCtx): void {
+        // Parsear [N]innerType
+        if (!preg_match('/^\[(\d+)\](.+)$/', $arrayType, $m)) return;
+        $innerType = $m[2]; // puede ser int32, float32, string, [2]int32, etc.
+
+   
+        $elemSize = $this->stackStrideFor($innerType);
+
+        $elements = $elementsCtx->arrayElement();
+        foreach ($elements as $idx => $elem) {
+            $elemOffset = $baseOffset + $idx * $elemSize;
+
+            if ($elem->arrayElements() !== null) {
+                // Elemento es una fila de array multidimensional: { ... }
+                $this->emitArrayLiteralElements($elemOffset, $innerType, $elem->arrayElements());
+            } else {
+                // Elemento es una expresión escalar
+                $this->visitExprIntoX0($elem->expression());
+                $this->emitStoreByType($innerType, $elemOffset);
+            }
+        }
+    }
+
+    /** Stride real en stack para un tipo (cuántos bytes ocupa cada elemento en el array). */
+    private function stackStrideFor(string $type): int {
+        if (preg_match('/^\[\d+\]/', $type)) {
+            // Sub-array: usar typeSize completo
+            return $this->symbolTable->typeSize($type);
+        }
+        return match($type) {
+            'int32', 'bool', 'rune', 'int' => 4,
+            'float32'                       => 4,
+            'float64'                       => 8,
+            'string'                        => 8,  // guardamos solo el puntero
+            default                         => 8,
+        };
+    }
+
+    /** Emite la instrucción store correcta según el tipo, en [x29, #offset]. */
+    private function emitStoreByType(string $type, int $offset): void {
+        if ($type === 'float32') {
+            $this->instr('str', 's0', "[x29, #{$offset}]");
+        } elseif ($type === 'string') {
+            // string se guarda como puntero de 8 bytes
+            $this->instr('str', 'x0', "[x29, #{$offset}]");
+        } elseif ($type === 'int32' || $type === 'bool' || $type === 'rune' || $type === 'int') {
+            // 4 bytes
+            $this->instr('str', 'w0', "[x29, #{$offset}]");
+        } else {
+            // por defecto 8 bytes (puntero, etc.)
+            $this->instr('str', 'x0', "[x29, #{$offset}]");
+        }
+    }
+
+
+    private function findArrayLiteral($ctx) {
+        if (method_exists($ctx, 'arrayLiteral') && $ctx->arrayLiteral() !== null) {
+            return $ctx->arrayLiteral();
+        }
+        // Bajar por la jerarquía de expresión
+        foreach (['logicalOr','logicalAnd','equality','comparison','addition',
+                'multiplication','unary','primaryExpr','operand','literal'] as $method) {
+            if (method_exists($ctx, $method)) {
+                $child = $ctx->$method();
+                if (is_array($child)) $child = $child[0] ?? null;
+                if ($child !== null) {
+                    $result = $this->findArrayLiteral($child);
+                    if ($result !== null) return $result;
+                }
+            }
+        }
+        return null;
     }
 
     public function visitShortVarDecl($ctx): void {
         $ids   = $ctx->idList()->ID();
         $exprs = $ctx->expressionList()->expression();
 
+        // Caso especial: una sola expresión que es llamada a función con múltiple retorno
+        if (count($exprs) === 1 && count($ids) > 1) {
+            $expr = $exprs[0];
+            $this->visitExprIntoX0($expr);
+            // Los retornos están en x0, x1, x2...
+            foreach ($ids as $i => $idToken) {
+                $name   = $idToken->getText();
+                $offset = $this->resolveOffset($name);
+                if ($offset < 0) continue;
+                $type = $this->symbolTable->lookup($name)['type'] ?? 'int32';
+                if ($i === 0) {
+                    $this->instr('str', 'x0', "[x29, #{$offset}]");
+                } else {
+                    $this->instr('str', "x{$i}", "[x29, #{$offset}]");
+                }
+            }
+            return;
+        }
+
+        // Caso normal: múltiples expresiones
         foreach ($ids as $i => $idToken) {
             $name   = $idToken->getText();
-            $offset = $this->symbolTable->getOffset($name);
+            $offset = $this->resolveOffset($name);
             if ($offset < 0) continue;
 
             $expr = $exprs[$i] ?? null;
             if ($expr !== null) {
-                $this->visitExprIntoX0($expr);
-                $type = $this->symbolTable->lookup($name)['type'] ?? 'int32';
-                if ($type === 'float32') {
-                    $this->instr('str', 's0', "[sp, #{$offset}]");
+                if ($this->isArrayLiteralExpr($expr)) {
+                    $this->emitArrayLiteralInit($name, $offset, $expr);
                 } else {
-                    $this->instr('str', 'x0', "[sp, #{$offset}]");
+                    $this->visitExprIntoX0($expr);
+                    $type = $this->symbolTable->lookup($name)['type'] ?? 'int32';
+                    if ($type === 'float32') {
+                        $this->instr('str', 's0', "[x29, #{$offset}]");
+                    } else {
+                        $this->instr('str', 'x0', "[x29, #{$offset}]");
+                    }
                 }
             }
         }
@@ -248,11 +383,11 @@ class CodeGenerator extends GrammarBaseVisitor {
 
     public function visitConstDecl($ctx): void {
         $name   = $ctx->ID()->getText();
-        $offset = $this->symbolTable->getOffset($name);
+        $offset = $this->resolveOffset($name);
         if ($offset < 0) return;
 
         $this->visitExprIntoX0($ctx->expression());
-        $this->instr('str', 'x0', "[sp, #{$offset}]");
+        $this->instr('str', 'x0', "[x29, #{$offset}]");
     }
 
     // ── Asignaciones ──────────────────────────────────────────────────────────
@@ -263,35 +398,54 @@ class CodeGenerator extends GrammarBaseVisitor {
         $exprs   = $ctx->expressionList()->expression();
 
         foreach ($lValues as $i => $lv) {
-            $expr   = $exprs[$i] ?? null;
+            $expr = $exprs[$i] ?? null;
             if ($expr === null) continue;
 
-            $this->visitExprIntoX0($expr); // resultado en x0
+            $this->visitExprIntoX0($expr);
 
-            $name = $lv->ID()->getText();
-            $offset = $this->symbolTable->getOffset($name);
+            // *** FIX: asignación a través de puntero: *p = valor ***
+            if ($lv->STAR() !== null) {
+                $name   = $lv->ID()->getText();
+                $offset = $this->resolveOffset($name);
+                $this->instr('mov', 'x9', 'x0');
+                $this->instr('ldr', 'x10', "[x29, #{$offset}]");  // ← x29 no sp
+                $this->instr('str', 'x9', '[x10]');
+                continue;
+            }
+
+            $name   = $lv->ID()->getText();
+            $offset = $this->resolveOffset($name);
             if ($offset < 0) continue;
 
             if ($op !== '=') {
-                // Operador compuesto: leer valor actual
-                $this->instr('ldr', 'x1', "[sp, #{$offset}]");
+                $this->instr('ldr', 'x1', "[x29, #{$offset}]");
                 switch ($op) {
-                    case '+=': $this->instr('add', 'x0', 'x1', 'x0'); break;
-                    case '-=': $this->instr('sub', 'x0', 'x1', 'x0'); break;
-                    case '*=': $this->instr('mul', 'x0', 'x1', 'x0'); break;
+                    case '+=': $this->instr('add',  'x0', 'x1', 'x0'); break;
+                    case '-=': $this->instr('sub',  'x0', 'x1', 'x0'); break;
+                    case '*=': $this->instr('mul',  'x0', 'x1', 'x0'); break;
                     case '/=': $this->instr('sdiv', 'x0', 'x1', 'x0'); break;
                 }
             }
 
-            // Manejar índices de arreglo
             $indices = $lv->expression();
             if ($indices !== null && count($indices) > 0) {
-                $this->instr('mov', 'x9', 'x0'); // guardar valor
-                // Calcular dirección del elemento
+                $this->instr('mov', 'x9', 'x0');
                 $this->emitArrayAddress($name, $indices);
-                $this->instr('str', 'x9', '[x10]');
+                // Determinar el tipo del elemento para el store correcto
+                $arrInfo = $this->symbolTable->lookup($name);
+                $arrType = $arrInfo['type'] ?? 'int32';
+                $depth   = count($indices);
+                $elemType = $arrType;
+                for ($d = 0; $d < $depth; $d++) {
+                    $elemType = $this->getElementType($elemType);
+                }
+                if ($elemType === 'int32' || $elemType === 'bool' || $elemType === 'rune' || $elemType === 'int') {
+                    $this->instr('str', 'w9', '[x10]');
+                } else {
+                    $this->instr('str', 'x9', '[x10]');
+                }
             } else {
-                $this->instr('str', 'x0', "[sp, #{$offset}]");
+                $this->instr('str', 'x0', "[x29, #{$offset}]");  // ← x29, no sp
             }
         }
     }
@@ -299,13 +453,13 @@ class CodeGenerator extends GrammarBaseVisitor {
     public function visitIncDecStmt($ctx): void {
         $lv     = $ctx->lValue();
         $name   = $lv->ID()->getText();
-        $offset = $this->symbolTable->getOffset($name);
+        $offset = $this->resolveOffset($name);
         if ($offset < 0) return;
 
-        $this->instr('ldr', 'x0', "[sp, #{$offset}]");
+        $this->instr('ldr', 'x0', "[x29, #{$offset}]");
         $isInc = $ctx->INC() !== null;
         $this->instr($isInc ? 'add' : 'sub', 'x0', 'x0', '#1');
-        $this->instr('str', 'x0', "[sp, #{$offset}]");
+        $this->instr('str', 'x0', "[x29, #{$offset}]");
     }
 
     // ── Control de flujo ──────────────────────────────────────────────────────
@@ -438,13 +592,15 @@ class CodeGenerator extends GrammarBaseVisitor {
             $exprs = $ctx->expressionList()->expression();
             if (count($exprs) === 1) {
                 $this->visitExprIntoX0($exprs[0]);
-                // resultado ya en x0
             } else {
-                // Múltiple retorno: x0, x1, x2...
+                // Evaluar todos y guardar en staging antes de mover a x0,x1,x2...
+                $staging = ['x9','x10','x11','x12'];
                 foreach ($exprs as $i => $expr) {
                     $this->visitExprIntoX0($expr);
-                    if ($i > 0) $this->instr('mov', "x{$i}", 'x0');
-                    // x0 ya tiene el primero
+                    $this->instr('mov', $staging[$i], 'x0');
+                }
+                foreach ($exprs as $i => $_) {
+                    $this->instr('mov', "x{$i}", $staging[$i]);
                 }
             }
         }
@@ -470,34 +626,120 @@ class CodeGenerator extends GrammarBaseVisitor {
         $args = ($ctx->argumentList() !== null) ? $ctx->argumentList()->argument() : [];
         $argCount = count($args);
 
-        // Evaluar cada argumento y moverlo al registro correcto.
-        // Para evitar que la evaluación del arg[i] sobreescriba x19 (que puede
-        // contener el operando izquierdo de una expresión pendiente), usamos
-        // registros x9-x15 como staging area antes de mover a x0-x7.
-        $stagingRegs = ['x9','x10','x11','x12','x13','x14','x15','x16'];
-
-        foreach ($args as $i => $arg) {
-            if ($arg->AMP() !== null) {
-                $varName = $arg->ID()->getText();
-                $offset  = $this->symbolTable->getOffset($varName);
-                if ($offset < 0 && $this->currentFunc !== '') {
-                    $offset = $this->symbolTable->getParamOffset($this->currentFunc, $varName);
-                }
-                $this->instr('add', $stagingRegs[$i] ?? 'x9', 'sp', "#$offset");
-            } else {
-                $this->visitExprIntoX0($arg->expression());
-                $this->instr('mov', $stagingRegs[$i] ?? 'x9', 'x0');
+        $funcInfo   = $this->symbolTable->getFunction($name);
+        $paramTypes = [];
+        if ($funcInfo) {
+            foreach ($funcInfo['params'] ?? [] as $p) {
+                $paramTypes[] = $p['type'];
             }
         }
 
-        // Mover de staging a registros de argumento ABI (x0-x7)
-        for ($i = 0; $i < $argCount; $i++) {
-            $this->instr('mov', "x{$i}", $stagingRegs[$i] ?? 'x9');
+        $stagingRegsInt   = ['x9','x10','x11','x12','x13','x14','x15','x16'];
+        $stagingRegsFloat = ['s8','s9','s10','s11','s12','s13','s14','s15'];
+
+        // Una sola pasada: evaluar y guardar en staging, recordar qué registro usó cada arg
+        $assignments = []; // [['kind'=>'int'|'float', 'staging'=>'x9', 'dest'=>'x0'], ...]
+        $intIdx   = 0;
+        $floatIdx = 0;
+
+        foreach ($args as $i => $arg) {
+            $hasAmp = $arg->AMP() !== null;
+            $this->comment("DEBUG arg $i hasAmp=$hasAmp text=" . $arg->getText());
         }
 
+        foreach ($args as $i => $arg) {
+            $paramType = $paramTypes[$i] ?? 'int32';
+            $isFloat   = ($paramType === 'float32');
+            $isPtr     = str_starts_with($paramType, '*');
+            $hasAmp    = $arg->AMP() !== null;
+            $exprText  = $arg->expression() !== null ? $arg->expression()->getText() : '';
+            $exprHasAmp = str_starts_with($exprText, '&');
+
+            if ($hasAmp) {
+                $varName = $arg->ID()->getText();
+
+                $localOffset = $this->symbolTable->getOffset($varName);
+                $paramOffset = ($this->currentFunc !== '')
+                    ? $this->symbolTable->getParamOffset($this->currentFunc, $varName)
+                    : -1;
+
+                if ($localOffset >= 0) {
+                    $base = 'sp';
+                    $offset = $localOffset;
+                } elseif ($paramOffset >= 0) {
+                    $base = 'x29';
+                    $offset = $paramOffset;
+                } else {
+                    continue; // evita usar basura
+                }
+
+                $staging = $stagingRegsInt[$intIdx];
+                $this->instr('add', $staging, $base, "#$offset");
+
+                $assignments[] = ['kind' => 'int', 'staging' => $staging, 'dest' => "x{$intIdx}"];
+                $intIdx++;
+            } elseif ($exprHasAmp) {
+                // &var dentro de la expresión (unary en el árbol)
+                $expr = $arg->expression();
+                if ($expr === null) continue;
+
+                $text = $expr->getText();
+                if ($text[0] !== '&') continue;
+
+                $varName = substr($text, 1);
+                $localOffset = $this->symbolTable->getOffset($varName);
+                $paramOffset = ($this->currentFunc !== '')
+                    ? $this->symbolTable->getParamOffset($this->currentFunc, $varName)
+                    : -1;
+
+                if ($localOffset >= 0) {
+                    $base = 'sp';
+                    $offset = $localOffset;
+                } elseif ($paramOffset >= 0) {
+                    $base = 'x29';
+                    $offset = $paramOffset;
+                } else {
+                    // fallback seguro
+                    continue;
+                }
+
+
+                $staging = $stagingRegsInt[$intIdx];
+
+                $this->instr('add', $staging, $base, "#$offset");
+                $assignments[] = ['kind' => 'int', 'staging' => $staging, 'dest' => "x{$intIdx}"];
+                $intIdx++;
+
+            } elseif ($isFloat) {
+                $this->visitExprIntoX0($arg->expression());
+                $staging = $stagingRegsFloat[$floatIdx];
+                $this->instr('fmov', $staging, 's0');
+                $assignments[] = ['kind' => 'float', 'staging' => $staging, 'dest' => "s{$floatIdx}"];
+                $floatIdx++;
+
+            } else {
+                $this->visitExprIntoX0($arg->expression());
+                $staging = $stagingRegsInt[$intIdx];
+                $this->instr('mov', $staging, 'x0');
+                $assignments[] = ['kind' => 'int', 'staging' => $staging, 'dest' => "x{$intIdx}"];
+                $intIdx++;
+            }
+        }
+
+        // Segunda pasada: mover de staging a registros ABI finales
+        foreach ($assignments as $a) {
+            if ($a['kind'] === 'float') {
+                $this->instr('fmov', $a['dest'], $a['staging']);
+            } else {
+                $this->instr('mov', $a['dest'], $a['staging']);
+            }
+        }
+        $retType = $this->symbolTable->getFunction($name)['returnType'] ?? 'int32';
+        $this->lastResultWasFloat = ($retType === 'float32');
         $this->instr('bl', $name);
-        // Resultado en x0
+    
     }
+
 
     // ── fmt.Println ───────────────────────────────────────────────────────────
 
@@ -736,15 +978,26 @@ class CodeGenerator extends GrammarBaseVisitor {
         $this->visit($children[0]);
         if (count($children) === 1) return;
 
+        $isFloat = $this->lastResultWasFloat;
+
         for ($i = 1; $i < count($children); $i++) {
-            // Guardar operando izquierdo en stack para evitar clobber por expresiones anidadas
-            $this->instr('sub', 'sp', 'sp', '#16');
-            $this->instr('str', 'x0', '[sp, #0]');
-            $this->visit($children[$i]);
-            $this->instr('ldr', 'x19', '[sp, #0]');
-            $this->instr('add', 'sp', 'sp', '#16');
             $op = $ctx->getChild($i * 2 - 1)->getText();
-            $this->instr($op === '+' ? 'add' : 'sub', 'x0', 'x19', 'x0');
+            if ($isFloat) {
+                $this->instr('sub', 'sp', 'sp', '#16');
+                $this->instr('str', 's0', '[sp, #0]');
+                $this->visit($children[$i]);
+                $this->instr('ldr', 's19', '[sp, #0]');
+                $this->instr('add', 'sp', 'sp', '#16');
+                $this->instr($op === '+' ? 'fadd' : 'fsub', 's0', 's19', 's0');
+                $this->lastResultWasFloat = true;
+            } else {
+                $this->instr('sub', 'sp', 'sp', '#16');
+                $this->instr('str', 'x0', '[sp, #0]');
+                $this->visit($children[$i]);
+                $this->instr('ldr', 'x19', '[sp, #0]');
+                $this->instr('add', 'sp', 'sp', '#16');
+                $this->instr($op === '+' ? 'add' : 'sub', 'x0', 'x19', 'x0');
+            }
         }
     }
 
@@ -753,35 +1006,48 @@ class CodeGenerator extends GrammarBaseVisitor {
         $this->visit($children[0]);
         if (count($children) === 1) return;
 
+        $isFloat = $this->lastResultWasFloat;
+
         for ($i = 1; $i < count($children); $i++) {
-            // Guardar operando izquierdo en stack para evitar clobber
-            $this->instr('sub', 'sp', 'sp', '#16');
-            $this->instr('str', 'x0', '[sp, #0]');
-            $this->visit($children[$i]);
-            $this->instr('ldr', 'x19', '[sp, #0]');
-            $this->instr('add', 'sp', 'sp', '#16');
             $op = $ctx->getChild($i * 2 - 1)->getText();
-            switch ($op) {
-                case '*': $this->instr('mul', 'x0', 'x19', 'x0'); break;
-                case '/':
-                    $labelOk = $this->newLabel('div_ok');
-                    $this->instr('cmp', 'x0', '#0');
-                    $this->instr('b.ne', $labelOk);
-                    $this->loadImmediate('x0', 0); // fallback
-                    $this->instr('b', $labelOk);
-                    $this->emitLabel($labelOk);
-                    $this->instr('sdiv', 'x0', 'x19', 'x0');
-                    break;
-                case '%':
-                    $this->instr('sub', 'sp', 'sp', '#16');
-                    $this->instr('str', 'x0', '[sp, #0]');   // guardar b
-                    
-                    $this->instr('sdiv', 'x0', 'x19', 'x0');  // a/b
-                    $this->instr('ldr', 'x20', '[sp, #0]');  // b
-                    $this->instr('add', 'sp', 'sp', '#16');
-                    $this->instr('mul',  'x0', 'x0', 'x20');   // (a/b)*b
-                    $this->instr('sub',  'x0', 'x19', 'x0');   // a - (a/b)*b
-                    break;
+            if ($isFloat) {
+                $this->instr('sub', 'sp', 'sp', '#16');
+                $this->instr('str', 's0', '[sp, #0]');
+                $this->visit($children[$i]);
+                $this->instr('ldr', 's19', '[sp, #0]');
+                $this->instr('add', 'sp', 'sp', '#16');
+                switch ($op) {
+                    case '*': $this->instr('fmul', 's0', 's19', 's0'); break;
+                    case '/': $this->instr('fdiv', 's0', 's19', 's0'); break;
+                }
+                $this->lastResultWasFloat = true;
+            } else {
+                $this->instr('sub', 'sp', 'sp', '#16');
+                $this->instr('str', 'x0', '[sp, #0]');
+                $this->visit($children[$i]);
+                $this->instr('ldr', 'x19', '[sp, #0]');
+                $this->instr('add', 'sp', 'sp', '#16');
+                switch ($op) {
+                    case '*': $this->instr('mul', 'x0', 'x19', 'x0'); break;
+                    case '/':
+                        $labelOk = $this->newLabel('div_ok');
+                        $this->instr('cmp', 'x0', '#0');
+                        $this->instr('b.ne', $labelOk);
+                        $this->loadImmediate('x0', 0);
+                        $this->instr('b', $labelOk);
+                        $this->emitLabel($labelOk);
+                        $this->instr('sdiv', 'x0', 'x19', 'x0');
+                        break;
+                    case '%':
+                        $this->instr('sub', 'sp', 'sp', '#16');
+                        $this->instr('str', 'x0', '[sp, #0]');
+                        $this->instr('sdiv', 'x0', 'x19', 'x0');
+                        $this->instr('ldr', 'x20', '[sp, #0]');
+                        $this->instr('add', 'sp', 'sp', '#16');
+                        $this->instr('mul',  'x0', 'x0', 'x20');
+                        $this->instr('sub',  'x0', 'x19', 'x0');
+                        break;
+                }
             }
         }
     }
@@ -831,14 +1097,80 @@ class CodeGenerator extends GrammarBaseVisitor {
         }
         // primaryExpr[index]
         if ($ctx->primaryExpr() !== null && $ctx->expression() !== null) {
+
+            // Evaluar base (arr) → x0 = dirección base (puede ser fila de 2D)
             $this->visit($ctx->primaryExpr());
-            // x0 tiene la dirección base del arreglo
-            $this->instr('mov', 'x19', 'x0');
+
+            // Guardar base
+            $this->instr('sub', 'sp', 'sp', '#16');
+            $this->instr('str', 'x0', '[sp, #0]');
+
+            // Evaluar índice
             $this->visitExprIntoX0($ctx->expression());
-            // offset = index * 8 (tamaño elemento simplificado)
-            $this->instr('lsl', 'x0', 'x0', '#3');
-            $this->instr('add', 'x0', 'x19', 'x0');
-            $this->instr('ldr', 'x0', '[x0]');
+
+            // Obtener el nombre REAL del array (navegar hasta el operand más profundo)
+            // y contar cuántas dimensiones de indexación hay entre este nodo y el operand
+            $baseCtx    = $ctx->primaryExpr();
+            $indexDepth = 1; // este nodo añade 1
+            while ($baseCtx->primaryExpr() !== null) {
+                $indexDepth++;
+                $baseCtx = $baseCtx->primaryExpr();
+            }
+            $name = $baseCtx->getText();
+
+            // Obtener tipo del array completo
+            $arrayType = 'int32';
+            $info = $this->symbolTable->lookup($name);
+            if ($info) {
+                $arrayType = $info['type'];
+            } elseif ($this->currentFunc !== '') {
+                $paramOffset = $this->symbolTable->getParamOffset($this->currentFunc, $name);
+                if ($paramOffset >= 0) {
+                    $func = $this->symbolTable->getFunction($this->currentFunc);
+                    foreach ($func['params'] ?? [] as $p) {
+                        if (($p['name'] ?? null) === $name) {
+                            $arrayType = $p['type'] ?? 'int32';
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Bajar $indexDepth niveles para obtener el tipo del elemento en ESTE nivel
+            // p.ej. [2][2]int32 con depth=1 → [2]int32; depth=2 → int32
+            $currentType = $arrayType;
+            for ($d = 0; $d < $indexDepth; $d++) {
+                $currentType = $this->getElementType($currentType);
+            }
+            $elemType  = $currentType;
+            $elemSize  = $this->stackStrideFor($elemType);
+            $elemShift = $this->sizeToShift($elemSize);
+
+            $this->instr('lsl', 'x0', 'x0', "#$elemShift");
+
+            // Recuperar base
+            $this->instr('ldr', 'x9', '[sp, #0]');
+            $this->instr('add', 'sp', 'sp', '#16');
+
+            // Dirección final del elemento
+            $this->instr('add', 'x0', 'x9', 'x0');
+
+            // Cargar valor según tipo del elemento
+            if ($elemType === 'float32') {
+                $this->instr('ldr', 's0', '[x0]');
+                $this->lastResultWasFloat = true;
+            } elseif (preg_match('/^\[\d+\]/', $elemType)) {
+                // Elemento es un sub-array (fila de 2D): dejar x0 como dirección base
+                $this->lastResultWasFloat = false;
+            } elseif ($elemType === 'string') {
+                $this->instr('ldr', 'x0', '[x0]');
+                $this->lastResultWasFloat = false;
+            } else {
+                // int32, bool, rune: cargar 32 bits y sign-extend
+                $this->instr('ldr', 'w0', '[x0]');
+                $this->instr('sxtw', 'x0', 'w0');
+                $this->lastResultWasFloat = false;
+            }
         }
     }
 
@@ -849,39 +1181,95 @@ class CodeGenerator extends GrammarBaseVisitor {
         }
         if ($ctx->NIL() !== null) {
             $this->loadImmediate('x0', 0);
+            $this->lastResultWasFloat = false;
             return;
         }
         if ($ctx->AMP() !== null && $ctx->ID() !== null) {
             $name   = $ctx->ID()->getText();
-            $offset = $this->symbolTable->getOffset($name);
-            $this->instr('add', 'x0', 'sp', "#$offset");
+            $offset = $this->resolveOffset($name);
+            if ($offset >= 0) {
+                $this->instr('add', 'x0', 'x29', "#$offset");
+            } else {
+                $this->loadImmediate('x0', 0);
+            }
+            $this->lastResultWasFloat = false;
             return;
         }
         if ($ctx->STAR() !== null && $ctx->ID() !== null) {
             $name   = $ctx->ID()->getText();
-            $offset = $this->symbolTable->getOffset($name);
-            $this->instr('ldr', 'x0', "[sp, #{$offset}]");
+            $offset = $this->resolveOffset($name);
+            if ($offset >= 0) {
+                $this->instr('ldr', 'x0', "[x29, #{$offset}]");
+            } else {
+                $this->loadImmediate('x0', 0);
+                return;
+            }
             $this->instr('ldr', 'x0', '[x0]');
+            $this->lastResultWasFloat = false;
             return;
         }
         if ($ctx->ID() !== null) {
             $name   = $ctx->ID()->getText();
-            $offset = $this->symbolTable->getOffset($name);
-            // Si no hay offset local, buscar en parámetros de la función actual
-            if ($offset < 0 && $this->currentFunc !== '') {
-                $offset = $this->symbolTable->getParamOffset($this->currentFunc, $name);
+            $type   = 'int32';
+            $offset = -1;
+
+            // 1. Buscar primero en parámetros (tienen prioridad sobre vars locales de scopes internos)
+            if ($this->currentFunc !== '') {
+                $paramOffset = $this->symbolTable->getParamOffset($this->currentFunc, $name);
+                if ($paramOffset >= 0) {
+                    $offset = $paramOffset;
+                    $func   = $this->symbolTable->getFunction($this->currentFunc);
+                    foreach ($func['params'] ?? [] as $p) {
+                        if (($p['name'] ?? null) === $name) {
+                            $type = $p['type'] ?? 'int32';
+                            break;
+                        }
+                    }
+                }
             }
-            if ($offset >= 0) {
+
+            // 2. Si no es parámetro, buscar en variables locales de la función actual
+            if ($offset < 0 && $this->currentFunc !== '') {
+                $localOffset = $this->symbolTable->getLocalOffset($this->currentFunc, $name);
+                if ($localOffset >= 0) {
+                    $offset = $localOffset;
+                    $info = $this->symbolTable->lookup($name);
+                    if ($info) $type = $info['type'];
+                }
+            }
+
+            // 3. Fallback: búsqueda global (variables globales, etc.)
+            if ($offset < 0) {
                 $info = $this->symbolTable->lookup($name);
-                $type = $info['type'] ?? 'int32';
-                // Si no se encontró en SymbolTable, asumir int32 (es un parámetro)
+                if ($info) {
+                    $type   = $info['type'];
+                    $offset = $info['offset'];
+                }
+            }
+
+            // 3. Emitir la carga según tipo
+            if ($offset >= 0) {
                 if ($type === 'float32') {
-                    $this->instr('ldr', 's0', "[sp, #{$offset}]");
+                    $this->instr('ldr', 's0', "[x29, #{$offset}]");
+                    $this->lastResultWasFloat = true;
+                } elseif (preg_match('/^\[\d+\]/', $type)) {
+                    // Array: parámetro = puntero almacenado (ldr), local = dirección directa (add)
+                    $isParam = ($this->currentFunc !== '' &&
+                                $this->symbolTable->getParamOffset($this->currentFunc, $name) >= 0);
+                    if ($isParam) {
+                        $this->instr('ldr', 'x0', "[x29, #{$offset}]");
+                    } else {
+                        $this->instr('add', 'x0', 'x29', "#$offset");
+                    }
+                    $this->lastResultWasFloat = false;
                 } else {
-                    $this->instr('ldr', 'x0', "[sp, #{$offset}]");
+                    // int32, bool, rune, string, puntero: cargar valor
+                    $this->instr('ldr', 'x0', "[x29, #{$offset}]");
+                    $this->lastResultWasFloat = false;
                 }
             } else {
                 $this->loadImmediate('x0', 0);
+                $this->lastResultWasFloat = false;
             }
             return;
         }
@@ -894,6 +1282,7 @@ class CodeGenerator extends GrammarBaseVisitor {
         if ($ctx->INT_LIT() !== null) {
             $val = (int)$ctx->INT_LIT()->getText();
             $this->loadImmediate('x0', $val);
+            $this->lastResultWasFloat = false;
             return;
         }
         if ($ctx->FLOAT_LIT() !== null) {
@@ -902,6 +1291,7 @@ class CodeGenerator extends GrammarBaseVisitor {
             $bits = unpack('L', pack('f', (float)$val))[1];
             $this->instr('ldr', 'w0', "=$bits");
             $this->instr('fmov', 's0', 'w0');
+            $this->lastResultWasFloat = true;
             return;
         }
         if ($ctx->STRING_LIT() !== null) {
@@ -911,14 +1301,17 @@ class CodeGenerator extends GrammarBaseVisitor {
             $label = $this->getStringLabel($inner);
             $this->instr('adrp', 'x0', $label);
             $this->instr('add', 'x0', 'x0', ":lo12:{$label}");
+            $this->lastResultWasFloat = false;
             return;
         }
         if ($ctx->TRUE() !== null) {
             $this->loadImmediate('x0', 1);
+            $this->lastResultWasFloat = false;
             return;
         }
         if ($ctx->FALSE() !== null) {
             $this->loadImmediate('x0', 0);
+            $this->lastResultWasFloat = false;
             return;
         }
         if ($ctx->RUNE_LIT() !== null) {
@@ -926,6 +1319,7 @@ class CodeGenerator extends GrammarBaseVisitor {
             $char = substr($raw, 1, -1);
             $val  = strlen($char) === 1 ? ord($char) : ord(stripcslashes($char));
             $this->loadImmediate('x0', $val);
+            $this->lastResultWasFloat = false;
             return;
         }
         if ($ctx->arrayLiteral() !== null) {
@@ -934,25 +1328,40 @@ class CodeGenerator extends GrammarBaseVisitor {
     }
 
     public function visitArrayLiteral($ctx): void {
-        // Arreglos: reservar espacio en stack e inicializar
-        // Para simplificar, usamos una región temporal
-        // En una implementación completa, esto iría en el frame
-        // Por ahora dejamos x0 = 0 como placeholder
-        $this->loadImmediate('x0', 0);
+        $elements = $ctx->arrayElements()->arrayElement();
+        $typeText  = $ctx->arrayTypeLiteral()->getText(); // ej: [5]int32
+        
+        // Determinar tamaño de elemento (int32 = 4 bytes)
+        $elemSize  = 4; // simplificado para int32
+        $elemShift = 2; // lsl #2
+        
+
+        $this->loadImmediate('x0', 0); // placeholder — ver abajo
     }
 
     // ── Built-ins ─────────────────────────────────────────────────────────────
 
     public function visitLenCall($ctx): void {
-        // len(arr) — para arreglos fijos, el tamaño es conocido en compilación
-        // Para strings, leer la longitud del string object
-        $this->visitExprIntoX0($ctx->expression());
-        // Por ahora retornar tamaño del tipo
         $type = $this->getExprType($ctx->expression());
         if (preg_match('/^\[(\d+)\]/', $type, $m)) {
-            $this->instr('mov', 'x0', "#" . $m[1]);
+            // Array: longitud conocida en compilación
+            $this->instr('mov', 'x0', '#' . $m[1]);
+        } else {
+            // String: calcular strlen
+            $this->visitExprIntoX0($ctx->expression()); // x0 = puntero
+            // strlen inline: contar hasta null terminator
+            $labelLoop = $this->newLabel('strlen');
+            $labelEnd  = $this->newLabel('strlen_end');
+            $this->instr('mov', 'x1', '#0');           // contador
+            $this->emitLabel($labelLoop);
+            $this->instr('ldrb', 'w2', '[x0, x1]');
+            $this->instr('cbz',  'w2', $labelEnd);
+            $this->instr('add',  'x1', 'x1', '#1');
+            $this->instr('b',    $labelLoop);
+            $this->emitLabel($labelEnd);
+            $this->instr('mov', 'x0', 'x1');           // resultado en x0
         }
-        // Para string: x0 = longitud (simplificado)
+        $this->lastResultWasFloat = false;
     }
 
     public function visitTypeOfCall($ctx): void {
@@ -970,6 +1379,7 @@ class CodeGenerator extends GrammarBaseVisitor {
         } elseif ($target === 'int32' || $target === 'int') {
             $this->instr('fcvtzs', 'x0', 's0');
         }
+        $this->lastResultWasFloat = ($target === 'float32');
         // bool/string/rune: x0 ya tiene el valor
     }
 
@@ -981,14 +1391,58 @@ class CodeGenerator extends GrammarBaseVisitor {
     }
 
     public function visitSubstrCall($ctx): void {
-        // substr(str, start, len) — simplificado
-        $this->visitExprIntoX0($ctx->expression(0));
-        $this->instr('mov', 'x19', 'x0'); // base ptr
-        $this->visitExprIntoX0($ctx->expression(1));
-        $this->instr('add', 'x0', 'x19', 'x0'); // ptr + start
-    }
+        // Buffer estático para substr
+        if (!isset($this->stringLiterals['__substr_buf'])) {
+            $this->dataSection[] = '__substr_buf: .space 256';
+            $this->stringLiterals['__substr_buf'] = '__substr_buf';
+        }
 
+        $this->visitExprIntoX0($ctx->expression(0));
+        $this->instr('mov', 'x19', 'x0');
+
+        $this->visitExprIntoX0($ctx->expression(1));
+        $this->instr('add', 'x19', 'x19', 'x0');   // ptr + start
+
+        $this->visitExprIntoX0($ctx->expression(2));
+        $this->instr('mov', 'x20', 'x0');           // length
+
+        // Cargar dirección del buffer
+        $this->instr('adrp', 'x21', '__substr_buf');
+        $this->instr('add',  'x21', 'x21', ':lo12:__substr_buf');
+
+        // Copiar length bytes
+        $labelCopy = $this->newLabel('substr_cp');
+        $labelDone = $this->newLabel('substr_dn');
+        $this->instr('mov', 'x9', '#0');
+        $this->emitLabel($labelCopy);
+        $this->instr('cmp',  'x9', 'x20');
+        $this->instr('b.ge', $labelDone);
+        $this->instr('ldrb', 'w10', '[x19, x9]');
+        $this->instr('strb', 'w10', '[x21, x9]');
+        $this->instr('add',  'x9', 'x9', '#1');
+        $this->instr('b', $labelCopy);
+        $this->emitLabel($labelDone);
+        $this->instr('strb', 'wzr', '[x21, x9]');  // null terminator
+
+        $this->instr('mov', 'x0', 'x21');
+        $this->lastResultWasFloat = false;
+    }
     // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /**
+     * Resuelve el offset de stack de una variable en el contexto de la función actual.
+     * Prioridad: parámetro > variable local de función actual > lookup global.
+     * Devuelve -1 si no se encuentra.
+     */
+    private function resolveOffset(string $name): int {
+        if ($this->currentFunc !== '') {
+            $poff = $this->symbolTable->getParamOffset($this->currentFunc, $name);
+            if ($poff >= 0) return $poff;
+            $loff = $this->symbolTable->getLocalOffset($this->currentFunc, $name);
+            if ($loff >= 0) return $loff;
+        }
+        return $this->symbolTable->getOffset($name);
+    }
 
     private function loadImmediate(string $reg, int $value): void {
         if ($value >= -65535 && $value <= 65535) {
@@ -1035,25 +1489,175 @@ class CodeGenerator extends GrammarBaseVisitor {
             }
         }
 
-        // Expresiones compuestas: intentar inferir desde operadores
-        // && || ! -> bool
+        // Indexación: arr[i] o arr[i][j] — tipo del elemento
+        // Detectar patrón: identificador seguido de uno o más [...]
+        if (preg_match('/^([a-zA-Z_][a-zA-Z0-9_]*)(\[.+)$/', $text, $m)) {
+            $varName = $m[1];
+            $indexPart = $m[2];
+            // Contar cuántos índices hay (cuántos niveles de [] hay)
+            $depth = preg_match_all('/\[/', $indexPart);
+
+            $baseType = 'int32';
+            $info = $this->symbolTable->lookup($varName);
+            if ($info) {
+                $baseType = $info['type'];
+            }
+            // Quitar $depth dimensiones del tipo
+            for ($d = 0; $d < $depth; $d++) {
+                $baseType = $this->getElementType($baseType);
+            }
+            return $baseType;
+        }
+
+        if (preg_match('/^([a-zA-Z_][a-zA-Z0-9_]*)\(/', $text, $m)) {
+            $funcInfo = $this->symbolTable->getFunction($m[1]);
+            if ($funcInfo) return $funcInfo['returnType'] ?? 'int32';
+        }
+        // Builtins que retornan string
+        if (str_starts_with($text, 'now()')) return 'string';
+        if (str_starts_with($text, 'substr(')) return 'string';
+        if (str_starts_with($text, 'typeOf(')) return 'string';
+        if (str_starts_with($text, 'len(')) return 'int32';
+
+        // Expresiones con cast explícito: float32(...) -> float32
+        if (str_starts_with($text, 'float32(')) return 'float32';
+        if (str_starts_with($text, 'int32(') || str_starts_with($text, 'int(')) return 'int32';
+        if (str_starts_with($text, 'bool(')) return 'bool';
+        if (str_starts_with($text, 'string(')) return 'string';
+
+
+
+        // Expresiones compuestas
         if (str_contains($text, '&&') || str_contains($text, '||') || str_starts_with($text, '!')) return 'bool';
-        // Comparaciones -> bool
         if (preg_match('/[<>]=?|==|!=/', $text)) return 'bool';
-        if (preg_match('/&&|\|\||^!/', $text)) return 'bool';
-        // Rune literal
-        if (preg_match("/^'.*'$/", $text)) return 'rune';
 
         return 'int32';
     }
 
+    private function lastExprWasFloat($ctx): bool {
+        if ($ctx === null) return false;
+        $text = $ctx->getText();
+        
+        if (preg_match('/^\d+\.\d*$/', $text) || preg_match('/^\.\d+$/', $text)) return true;
+        if (str_starts_with($text, 'float32(')) return true;
+        
+        if (preg_match('/^[a-zA-Z_][a-zA-Z0-9_]*$/', $text)) {
+            // Buscar en symbol table (variables locales, params registrados como vars)
+            $info = $this->symbolTable->lookup($text);
+            if ($info) return $info['type'] === 'float32';
+            
+            // Buscar en paramOffsets: si tiene offset, intentar inferir tipo
+            // como fallback buscar en el scope actual si fue registrado
+            if ($this->currentFunc !== '') {
+                $offset = $this->symbolTable->getParamOffset($this->currentFunc, $text);
+                if ($offset >= 0) {
+                    // El parámetro existe — buscar su tipo en params[]
+                    $func = $this->symbolTable->getFunction($this->currentFunc);
+                    foreach ($func['params'] ?? [] as $p) {
+                        // params puede tener distintas estructuras según FunctionCollector
+                        $pname = $p['name'] ?? $p[0] ?? null;
+                        $ptype = $p['type'] ?? $p[1] ?? 'int32';
+                        if ($pname === $text) return $ptype === 'float32';
+                    }
+                }
+            }
+        }
+        
+        if (preg_match('/^([a-zA-Z_][a-zA-Z0-9_]*)\(/', $text, $m)) {
+            $funcInfo = $this->symbolTable->getFunction($m[1]);
+            if ($funcInfo) return ($funcInfo['returnType'] ?? '') === 'float32';
+        }
+        
+        return false;
+    }
+
+    /** Dado [N]T devuelve T. Dado *[N]T devuelve T. Dado T devuelve T. */
+    private function getElementType(string $arrayType): string {
+        // Quitar puntero inicial si lo hay
+        if (str_starts_with($arrayType, '*')) {
+            $arrayType = substr($arrayType, 1);
+        }
+        if (preg_match('/^\[\d+\](.+)$/', $arrayType, $m)) {
+            return $m[1];
+        }
+        return $arrayType; // ya es tipo escalar
+    }
+
+    /** Convierte tamaño en bytes a shift para lsl (potencia de 2). */
+    private function sizeToShift(int $size): int {
+        return match($size) {
+            1  => 0,
+            2  => 1,
+            4  => 2,
+            8  => 3,
+            16 => 4,
+            default => 3,
+        };
+    }
+
     private function emitArrayAddress(string $name, array $indices): void {
-        $offset = $this->symbolTable->getOffset($name);
-        $this->instr('add', 'x10', 'sp', "#$offset");
+        $offset = -1;
+        $type   = '';
+
+        // 1. Buscar primero en parámetros (tienen prioridad)
+        if ($this->currentFunc !== '') {
+            $paramOffset = $this->symbolTable->getParamOffset($this->currentFunc, $name);
+            if ($paramOffset >= 0) {
+                $offset = $paramOffset;
+                $func   = $this->symbolTable->getFunction($this->currentFunc);
+                foreach ($func['params'] ?? [] as $p) {
+                    if (($p['name'] ?? null) === $name) {
+                        $type = $p['type'] ?? '';
+                        break;
+                    }
+                }
+            }
+        }
+
+        // 2. Si no es parámetro, buscar en variables locales de la función actual
+        if ($offset < 0 && $this->currentFunc !== '') {
+            $localOffset = $this->symbolTable->getLocalOffset($this->currentFunc, $name);
+            if ($localOffset >= 0) {
+                $offset = $localOffset;
+                $info = $this->symbolTable->lookup($name);
+                if ($info) $type = $info['type'] ?? '';
+            }
+        }
+
+        // 3. Fallback: búsqueda global
+        if ($offset < 0) {
+            $info = $this->symbolTable->lookup($name);
+            if ($info) {
+                $offset = $info['offset'];
+                $type   = $info['type'] ?? '';
+            }
+        }
+
+        // Tamaño de elemento — se calcula por nivel dentro del loop de índices
+
+        // Calcular dirección base
+        $isParam = ($this->currentFunc !== '' &&
+                    $this->symbolTable->getParamOffset($this->currentFunc, $name) >= 0);
+        if (str_starts_with($type, '*') || ($isParam && preg_match('/^\[\d+\]/', $type))) {
+            // Parámetro array o puntero: el slot contiene un puntero, cargar con ldr
+            $this->instr('ldr', 'x10', "[x29, #{$offset}]");
+        } else {
+            // Array local: dirección base directa
+            $this->instr('add', 'x10', 'x29', "#$offset");
+        }
+
+        // Iterar índices, recalculando el stride por nivel
+        $currentType = $type;
         foreach ($indices as $idx) {
+            $elemType  = $this->getElementType($currentType);
+            $elemSize  = $this->stackStrideFor($elemType);
+            $elemShift = $this->sizeToShift($elemSize);
+
             $this->visitExprIntoX0($idx);
-            $this->instr('lsl', 'x0', 'x0', '#3');
+            $this->instr('lsl', 'x0', 'x0', "#$elemShift");
             $this->instr('add', 'x10', 'x10', 'x0');
+
+            $currentType = $elemType; // bajar un nivel de dimensión
         }
     }
 
@@ -1189,17 +1793,6 @@ class CodeGenerator extends GrammarBaseVisitor {
         $this->instr('mov', 'x0', 'x19');
         $this->instr('bl', '__print_int');
 
-        // imprimir '.'
-        $this->instr('sub',  'sp', 'sp', '#16');
-        $this->instr('mov',  'w0', '#46');
-        $this->instr('strb', 'w0', '[sp]');
-        $this->instr('mov',  'x1', 'sp');
-        $this->instr('mov',  'x2', '#1');
-        $this->instr('mov',  'x0', '#1');
-        $this->instr('mov',  'x8', '#64');
-        $this->instr('svc',  '#0');
-        $this->instr('add',  'sp', 'sp', '#16');
-
         // --- Parte fraccionaria ---
         $this->instr('ldr',   's0', '[sp, #40]');   // restaurar s0
         $this->instr('scvtf', 's1', 'x19');          // s1 = float(parte_entera)
@@ -1211,10 +1804,28 @@ class CodeGenerator extends GrammarBaseVisitor {
         $this->instr('fmul',   's0', 's0', 's1');
         $this->instr('fcvtzs', 'x20', 's0');         // x20 = dígitos fraccionarios
 
-        // Imprimir 6 dígitos con ceros a la izquierda, eliminar ceros a la derecha
-        // Convertir x20 a string de 6 dígitos
+        $this->instr('fcvtzs', 'x20', 's0');
+
+        // Solo imprimir fracción si no es cero
+        $labelNoFrac = $this->newLabel('pf_nofrac');
+        $this->instr('cbz', 'x20', $labelNoFrac);
+
+        // imprimir '.' solo si hay fracción
+        $this->instr('sub',  'sp', 'sp', '#16');
+        $this->instr('mov',  'w0', '#46');
+        $this->instr('strb', 'w0', '[sp]');
+        $this->instr('mov',  'x1', 'sp');
+        $this->instr('mov',  'x2', '#1');
+        $this->instr('mov',  'x0', '#1');
+        $this->instr('mov',  'x8', '#64');
+        $this->instr('svc',  '#0');
+        $this->instr('add',  'sp', 'sp', '#16');
+
         $this->instr('mov', 'x0', 'x20');
         $this->instr('bl', '__print_frac6');
+
+        $this->emitLabel($labelNoFrac);
+
 
         $this->instr('ldr', 'x21',      '[sp, #32]');
         $this->instr('ldp', 'x19, x20', '[sp, #16]');

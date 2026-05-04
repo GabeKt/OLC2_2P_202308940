@@ -4,27 +4,13 @@ namespace Visitor;
 use GrammarBaseVisitor;
 use Semantic\SymbolTable;
 
-/**
- * OffsetCalculator — pasada previa a CodeGenerator.
- *
- * Recorre funcDecl y asigna un offset de stack a cada variable local.
- * Respeta alineación de 8 bytes (AArch64 requiere sp alineado a 16).
- *
- * Layout del stack frame de una función:
- *   [sp+0]   x29 (frame pointer)   — 8 bytes
- *   [sp+8]   x30 (link register)   — 8 bytes
- *   [sp+16]  parámetro 0 / var 0   — según tipo
- *   [sp+24]  parámetro 1 / var 1
- *   ...
- *
- * Los offsets se almacenan como desplazamiento POSITIVO desde sp.
- */
 class OffsetCalculator extends GrammarBaseVisitor {
 
     private SymbolTable $symbolTable;
     private string $currentFunc = '';
     private int $nextOffset = 16;
     private array $paramOffsets = []; // [funcName][paramName] => offset   // próximo offset disponible (16 = reserva x29/x30)
+    private array $localAssigned = []; // [funcName][varName] => offset (variables asignadas dinámicamente)
 
     public function __construct(SymbolTable $symbolTable) {
         $this->symbolTable = $symbolTable;
@@ -34,6 +20,8 @@ class OffsetCalculator extends GrammarBaseVisitor {
         $funcName = $ctx->ID()->getText();
         $this->currentFunc = $funcName;
         $this->nextOffset  = 40; // 16 para x29/x30 + 24 para x19/x20/x21
+        $this->localAssigned[$funcName] = [];
+        
 
         // Asignar offsets a parámetros desde el nodo de la gramática
         // (no desde SymbolTable.lookup porque los params viven en scopes temporales)
@@ -65,7 +53,7 @@ class OffsetCalculator extends GrammarBaseVisitor {
     }
 
     public function visitVarDecl($ctx): void {
-        if ($this->currentFunc === '') return; // global — sin offset
+        if ($this->currentFunc === '') return;
 
         $ids = $ctx->idList() !== null ? $ctx->idList()->ID() : [];
 
@@ -78,25 +66,25 @@ class OffsetCalculator extends GrammarBaseVisitor {
             $size = $this->symbolTable->typeSize($typeText);
             $size = max($size, 8);
             $this->symbolTable->setOffset($name, (int)$this->nextOffset);
+            $this->symbolTable->setLocalOffset($this->currentFunc, $name, (int)$this->nextOffset); // ← AGREGAR
+            $this->localAssigned[$this->currentFunc][$name] = true;
             $this->nextOffset += SymbolTable::alignUp((int)$size, 8);
         }
     }
 
     public function visitShortVarDecl($ctx): void {
         if ($this->currentFunc === '') return;
-
         $ids = $ctx->idList()->ID();
         foreach ($ids as $idToken) {
-            $name    = $idToken->getText();
-            $info    = $this->symbolTable->lookup($name);
-            $current = $info !== null ? $this->symbolTable->getOffset($name) : -1;
-
-            if ($info !== null && $current === -1) {
-                // Variable nueva — asignar offset
+            $name = $idToken->getText();
+            $info = $this->symbolTable->lookup($name);
+            if ($info !== null && !isset($this->localAssigned[$this->currentFunc][$name])) {
                 $type = $info['type'] ?? 'int32';
                 $size = $this->symbolTable->typeSize($type);
                 $size = max((int)$size, 8);
                 $this->symbolTable->setOffset($name, (int)$this->nextOffset);
+                $this->symbolTable->setLocalOffset($this->currentFunc, $name, (int)$this->nextOffset); // ← AGREGAR
+                $this->localAssigned[$this->currentFunc][$name] = true;
                 $this->nextOffset += SymbolTable::alignUp($size, 8);
             }
         }
