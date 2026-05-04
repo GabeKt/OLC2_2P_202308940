@@ -188,72 +188,85 @@ class CodeGenerator extends GrammarBaseVisitor {
     // ── Declaraciones ─────────────────────────────────────────────────────────
 
     public function visitVarDecl($ctx): void {
-    $ids = $ctx->idList() !== null ? $ctx->idList()->ID() : [];
+        $ids = $ctx->idList() !== null ? $ctx->idList()->ID() : [];
 
-    if ($ctx->expressionList() !== null) {
-        $exprs = $ctx->expressionList()->expression();
-        foreach ($ids as $i => $idToken) {
-            $name   = $idToken->getText();
-            $offset = $this->resolveOffset($name);
-            if ($offset < 0) continue;
+        if ($ctx->expressionList() !== null) {
+            $exprs = $ctx->expressionList()->expression();
+            foreach ($ids as $i => $idToken) {
+                $name   = $idToken->getText();
+                $offset = $this->resolveOffset($name);
+                if ($offset < 0) continue;
 
-            $expr = $exprs[$i] ?? null;
-            if ($expr === null) continue;
+                $expr = $exprs[$i] ?? null;
+                if ($expr === null) continue;
 
-            if ($this->isArrayLiteralExpr($expr)) {
-                $this->emitArrayLiteralInit($name, $offset, $expr);
-                continue;
-            }
-
-            // Detectar llamada a función que retorna array
-            $exprText = $expr->getText();
-            if (preg_match('/^([a-zA-Z_][a-zA-Z0-9_]*)\(/', $exprText, $m)) {
-                $calledFunc = $m[1];
-                $funcInfo   = $this->symbolTable->getFunction($calledFunc);
-                $retType    = $funcInfo['returnType'] ?? 'int32';
-                if (preg_match('/^\[\d+\]/', $retType)) {
-                    $this->comment("llamada con retorno array: x8 = destino offset $offset");
-                    $this->instr('add', 'x8', 'x29', "#$offset");
-                    $this->visitExprIntoX0($expr);
+                if ($this->isArrayLiteralExpr($expr)) {
+                    $this->emitArrayLiteralInit($name, $offset, $expr);
                     continue;
                 }
-            }
 
-            $this->visitExprIntoX0($expr);
-            $type = $this->symbolTable->lookup($name)['type'] ?? 'int32';
-            if ($type === 'float32') {
-                $this->instr('str', 's0', "[x29, #{$offset}]");
-            } else {
-                $this->instr('str', 'x0', "[x29, #{$offset}]");
-            }
-        }
-    } else {
-        // Sin inicialización — valor por defecto según tipo
-        foreach ($ids as $idToken) {
-            $name   = $idToken->getText();
-            $offset = $this->resolveOffset($name);
-            if ($offset < 0) continue;
-
-            $type = $this->symbolTable->lookup($name)['type'] ?? 'int32';
-
-            if (preg_match('/^\[(\d+)\](.+)$/', $type, $m)) {
-                $totalSize = $this->symbolTable->typeSize($type);
-                $this->loadImmediate('x0', 0);
-                for ($b = 0; $b < $totalSize; $b += 8) {
-                    $this->instr('str', 'x0', "[x29, #" . ($offset + $b) . "]");
+                // Detectar llamada a función que retorna array
+                $exprText = $expr->getText();
+                if (preg_match('/^([a-zA-Z_][a-zA-Z0-9_]*)\(/', $exprText, $m)) {
+                    $calledFunc = $m[1];
+                    $funcInfo   = $this->symbolTable->getFunction($calledFunc);
+                    $retType    = $funcInfo['returnType'] ?? 'int32';
+                    if (preg_match('/^\[\d+\]/', $retType)) {
+                        $this->comment("llamada con retorno array: x8 = destino offset $offset");
+                        $this->instr('add', 'x8', 'x29', "#$offset");
+                        $this->visitExprIntoX0($expr);
+                        continue;
+                    }
                 }
-            } elseif ($type === 'string') {
-                $label = $this->getStringLabel('');
-                $this->instr('adrp', 'x0', $label);
-                $this->instr('add',  'x0', 'x0', ":lo12:{$label}");
-                $this->instr('str', 'x0', "[x29, #{$offset}]");
-            } else {
-                $this->loadImmediate('x0', 0);
-                $this->instr('str', 'x0', "[x29, #{$offset}]");
+
+                $this->visitExprIntoX0($expr);
+
+                // *** Capturar flag INMEDIATAMENTE ***
+                $resultWasFloat = $this->lastResultWasFloat;
+
+                $registeredType = $this->symbolTable->lookup($name)['type'] ?? 'int32';
+                $isFloat = ($registeredType === 'float32') || $resultWasFloat || $this->isFloatVar($name);
+
+                if ($isFloat) {
+                    $this->floatVars[$this->currentFunc][$name] = true;
+                    $this->instr('str', 's0', "[x29, #{$offset}]");
+                } else {
+                    $this->instr('str', 'x0', "[x29, #{$offset}]");
+                }
+            }
+        } else {
+            // Sin inicialización — valor por defecto según tipo
+            foreach ($ids as $idToken) {
+                $name   = $idToken->getText();
+                $offset = $this->resolveOffset($name);
+                if ($offset < 0) continue;
+
+                $type = $this->symbolTable->lookup($name)['type'] ?? 'int32';
+
+                if (preg_match('/^\[(\d+)\](.+)$/', $type, $m)) {
+                    $totalSize = $this->symbolTable->typeSize($type);
+                    $this->loadImmediate('x0', 0);
+                    for ($b = 0; $b < $totalSize; $b += 8) {
+                        $this->instr('str', 'x0', "[x29, #" . ($offset + $b) . "]");
+                    }
+                } elseif ($type === 'string') {
+                    $label = $this->getStringLabel('');
+                    $this->instr('adrp', 'x0', $label);
+                    $this->instr('add',  'x0', 'x0', ":lo12:{$label}");
+                    $this->instr('str', 'x0', "[x29, #{$offset}]");
+                } elseif ($type === 'float32') {
+                    // Inicializar float a 0.0
+                    $this->floatVars[$this->currentFunc][$name] = true;
+                    $this->instr('ldr', 'w0', '=0');
+                    $this->instr('fmov', 's0', 'w0');
+                    $this->instr('str', 's0', "[x29, #{$offset}]");
+                } else {
+                    $this->loadImmediate('x0', 0);
+                    $this->instr('str', 'x0', "[x29, #{$offset}]");
+                }
             }
         }
     }
-}
 
     private function isArrayLiteralExpr($exprCtx): bool {
         // Navegar hasta literal -> arrayLiteral
@@ -350,7 +363,7 @@ class CodeGenerator extends GrammarBaseVisitor {
         return null;
     }
 
-    public function visitShortVarDecl($ctx): void {
+public function visitShortVarDecl($ctx): void {
     $ids   = $ctx->idList()->ID();
     $exprs = $ctx->expressionList()->expression();
 
@@ -401,12 +414,14 @@ class CodeGenerator extends GrammarBaseVisitor {
 
         $this->visitExprIntoX0($expr);
 
-        // Determinar si el resultado es float por tipo registrado o por lastResultWasFloat
+        // *** Capturar flag INMEDIATAMENTE después de evaluar ***
+        $resultWasFloat = $this->lastResultWasFloat;
+
+        // Determinar tipo registrado
         $registeredType = $this->symbolTable->lookup($name)['type'] ?? 'int32';
-        $isFloat = ($registeredType === 'float32') || $this->lastResultWasFloat;
+        $isFloat = ($registeredType === 'float32') || $resultWasFloat || $this->isFloatVar($name);
 
         if ($isFloat) {
-            // Marcar esta variable como float para usos posteriores
             $this->floatVars[$this->currentFunc][$name] = true;
             $this->instr('str', 's0', "[x29, #{$offset}]");
         } else {
@@ -437,6 +452,9 @@ class CodeGenerator extends GrammarBaseVisitor {
 
             $this->visitExprIntoX0($expr);
 
+            // *** Capturar flag INMEDIATAMENTE después de evaluar ***
+            $resultWasFloat = $this->lastResultWasFloat;
+
             // Asignación a través de puntero: *p = valor
             if ($lv->STAR() !== null) {
                 $name   = $lv->ID()->getText();
@@ -452,12 +470,29 @@ class CodeGenerator extends GrammarBaseVisitor {
             if ($offset < 0) continue;
 
             if ($op !== '=') {
-                $this->instr('ldr', 'x1', "[x29, #{$offset}]");
-                switch ($op) {
-                    case '+=': $this->instr('add',  'x0', 'x1', 'x0'); break;
-                    case '-=': $this->instr('sub',  'x0', 'x1', 'x0'); break;
-                    case '*=': $this->instr('mul',  'x0', 'x1', 'x0'); break;
-                    case '/=': $this->instr('sdiv', 'x0', 'x1', 'x0'); break;
+                if ($this->isFloatVar($name) || $resultWasFloat) {
+                    // Operaciones compuestas float: RHS ya está en s0
+                    $this->instr('sub', 'sp', 'sp', '#16');
+                    $this->instr('str', 's0', '[sp, #0]');          // salvar RHS
+                    $this->instr('ldr', 's0', "[x29, #{$offset}]"); // cargar LHS
+                    $this->instr('ldr', 's1', '[sp, #0]');          // recuperar RHS
+                    $this->instr('add', 'sp', 'sp', '#16');
+                    switch ($op) {
+                        case '+=': $this->instr('fadd', 's0', 's0', 's1'); break;
+                        case '-=': $this->instr('fsub', 's0', 's0', 's1'); break;
+                        case '*=': $this->instr('fmul', 's0', 's0', 's1'); break;
+                        case '/=': $this->instr('fdiv', 's0', 's0', 's1'); break;
+                    }
+                    $resultWasFloat = true;
+                    $this->lastResultWasFloat = true;
+                } else {
+                    $this->instr('ldr', 'x1', "[x29, #{$offset}]");
+                    switch ($op) {
+                        case '+=': $this->instr('add',  'x0', 'x1', 'x0'); break;
+                        case '-=': $this->instr('sub',  'x0', 'x1', 'x0'); break;
+                        case '*=': $this->instr('mul',  'x0', 'x1', 'x0'); break;
+                        case '/=': $this->instr('sdiv', 'x0', 'x1', 'x0'); break;
+                    }
                 }
             }
 
@@ -465,8 +500,7 @@ class CodeGenerator extends GrammarBaseVisitor {
             if ($indices !== null && count($indices) > 0) {
 
                 // Salvar valor ANTES de emitArrayAddress (puede destruir x0/s0)
-                $isFloatVal = $this->lastResultWasFloat;
-                if ($isFloatVal) {
+                if ($resultWasFloat) {
                     $this->instr('fmov', 's9', 's0');
                 } else {
                     $this->instr('mov', 'x9', 'x0');
@@ -474,7 +508,7 @@ class CodeGenerator extends GrammarBaseVisitor {
 
                 $this->emitArrayAddress($name, $indices);
 
-                // Resolver tipo del array: parámetros tienen prioridad sobre variables locales
+                // Resolver tipo del array: parámetros tienen prioridad
                 $arrType = '';
                 if ($this->currentFunc !== '') {
                     $paramOffset = $this->symbolTable->getParamOffset($this->currentFunc, $name);
@@ -500,7 +534,7 @@ class CodeGenerator extends GrammarBaseVisitor {
                     $elemType = $this->getElementType($elemType);
                 }
 
-                if ($elemType === 'float32') {
+                if ($elemType === 'float32' || $resultWasFloat) {
                     $this->instr('str', 's9', '[x10]');
                 } elseif ($elemType === 'int32' || $elemType === 'bool' || $elemType === 'rune' || $elemType === 'int') {
                     $this->instr('str', 'w9', '[x10]');
@@ -509,11 +543,12 @@ class CodeGenerator extends GrammarBaseVisitor {
                 }
 
             } else {
-                // Store simple (sin índices) — respetar tipo real de la variable
-                $isFloat = $this->isFloatVar($name) || $this->lastResultWasFloat;
+                // Store simple (sin índices)
+                // Para variables ya conocidas como float, usar isFloatVar()
+                // Para variables nuevas, confiar en lastResultWasFloat
+                $isFloat = $this->isFloatVar($name) || $resultWasFloat;
 
-                // Si el resultado fue float, marcar la variable para usos futuros
-                if ($this->lastResultWasFloat) {
+                if ($resultWasFloat) {
                     $this->floatVars[$this->currentFunc][$name] = true;
                 }
 
@@ -525,7 +560,6 @@ class CodeGenerator extends GrammarBaseVisitor {
             }
         }
     }
-    
     public function visitIncDecStmt($ctx): void {
         $lv     = $ctx->lValue();
         $name   = $lv->ID()->getText();
