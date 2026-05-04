@@ -511,3 +511,20 @@ ldp x29, x30, [sp, #0]
 add sp, sp, #frameSize
 ret
 ```
+El tamaño del frame (frameSize) es calculado previamente por el OffsetCalculator.
+
+### Manejo de Variables
+
+Las variables locales se almacenan en el stack.
+
+Cada variable tiene:
+
+- Offset dentro del stack frame
+- Tipo
+- Tamaño
+
+Ejemplo:
+```
+str x0, [sp, #offset]
+ldr x0, [sp, #offset]
+```

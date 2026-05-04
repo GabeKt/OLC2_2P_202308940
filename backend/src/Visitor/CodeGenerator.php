@@ -698,59 +698,59 @@ public function visitShortVarDecl($ctx): void {
     }
 
     public function visitReturnStatement($ctx): void {
-    if ($ctx->expressionList() !== null) {
-        $exprs = $ctx->expressionList()->expression();
-        if (count($exprs) === 1) {
-            $expr = $exprs[0];
-            // Verificar si el tipo de retorno de la función actual es un array
-            $funcInfo  = $this->symbolTable->getFunction($this->currentFunc);
-            $retType   = $funcInfo['returnType'] ?? 'int32';
-            $isArrRet  = (bool)preg_match('/^\[\d+\]/', $retType);
+        if ($ctx->expressionList() !== null) {
+            $exprs = $ctx->expressionList()->expression();
+            if (count($exprs) === 1) {
+                $expr = $exprs[0];
+                // Verificar si el tipo de retorno de la función actual es un array
+                $funcInfo  = $this->symbolTable->getFunction($this->currentFunc);
+                $retType   = $funcInfo['returnType'] ?? 'int32';
+                $isArrRet  = (bool)preg_match('/^\[\d+\]/', $retType);
 
-            if ($isArrRet) {
-                // Evaluar la expresión (deja dirección en x0)
-                $this->visitExprIntoX0($expr);
-                // x0 = dirección fuente, x8 = dirección destino (pasada por caller)
-                $totalSize = $this->symbolTable->typeSize($retType);
-                $this->comment("copiar array retorno: $totalSize bytes de x0 a x8");
-                $this->instr('mov', 'x9',  'x0');   // fuente
-                $this->instr('mov', 'x10', 'x8');   // destino
-                $bytes = 0;
-                while ($bytes < $totalSize) {
-                    $remaining = $totalSize - $bytes;
-                    if ($remaining >= 8) {
-                        $this->instr('ldr', 'x11', "[x9, #$bytes]");
-                        $this->instr('str', 'x11', "[x10, #$bytes]");
-                        $bytes += 8;
-                    } elseif ($remaining >= 4) {
-                        $this->instr('ldr', 'w11', "[x9, #$bytes]");
-                        $this->instr('str', 'w11', "[x10, #$bytes]");
-                        $bytes += 4;
-                    } else {
-                        $this->instr('ldrb', 'w11', "[x9, #$bytes]");
-                        $this->instr('strb', 'w11', "[x10, #$bytes]");
-                        $bytes += 1;
+                if ($isArrRet) {
+                    // Evaluar la expresión (deja dirección en x0)
+                    $this->visitExprIntoX0($expr);
+                    // x0 = dirección fuente, x8 = dirección destino (pasada por caller)
+                    $totalSize = $this->symbolTable->typeSize($retType);
+                    $this->comment("copiar array retorno: $totalSize bytes de x0 a x8");
+                    $this->instr('mov', 'x9',  'x0');   // fuente
+                    $this->instr('mov', 'x10', 'x8');   // destino
+                    $bytes = 0;
+                    while ($bytes < $totalSize) {
+                        $remaining = $totalSize - $bytes;
+                        if ($remaining >= 8) {
+                            $this->instr('ldr', 'x11', "[x9, #$bytes]");
+                            $this->instr('str', 'x11', "[x10, #$bytes]");
+                            $bytes += 8;
+                        } elseif ($remaining >= 4) {
+                            $this->instr('ldr', 'w11', "[x9, #$bytes]");
+                            $this->instr('str', 'w11', "[x10, #$bytes]");
+                            $bytes += 4;
+                        } else {
+                            $this->instr('ldrb', 'w11', "[x9, #$bytes]");
+                            $this->instr('strb', 'w11', "[x10, #$bytes]");
+                            $bytes += 1;
+                        }
                     }
+                    // x0 = destino (convención: retornar el puntero destino también)
+                    $this->instr('mov', 'x0', 'x8');
+                } else {
+                    $this->visitExprIntoX0($expr);
                 }
-                // x0 = destino (convención: retornar el puntero destino también)
-                $this->instr('mov', 'x0', 'x8');
             } else {
-                $this->visitExprIntoX0($expr);
-            }
-        } else {
-            // Múltiples valores de retorno
-            $staging = ['x9','x10','x11','x12'];
-            foreach ($exprs as $i => $expr) {
-                $this->visitExprIntoX0($expr);
-                $this->instr('mov', $staging[$i], 'x0');
-            }
-            foreach ($exprs as $i => $_) {
-                $this->instr('mov', "x{$i}", $staging[$i]);
+                // Múltiples valores de retorno
+                $staging = ['x9','x10','x11','x12'];
+                foreach ($exprs as $i => $expr) {
+                    $this->visitExprIntoX0($expr);
+                    $this->instr('mov', $staging[$i], 'x0');
+                }
+                foreach ($exprs as $i => $_) {
+                    $this->instr('mov', "x{$i}", $staging[$i]);
+                }
             }
         }
+        $this->instr('b', "{$this->currentFunc}_ret");
     }
-    $this->instr('b', "{$this->currentFunc}_ret");
-}
 
     public function visitBreakStmt($ctx): void {
         if (!empty($this->loopBreakStack)) {
