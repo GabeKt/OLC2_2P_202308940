@@ -597,9 +597,19 @@ class Interpreter extends GrammarBaseVisitor {
         return $result;
     }
 
-    public function visitComparison($ctx) {
+   public function visitComparison($ctx) {
         $children = $ctx->addition();
         $result   = $this->visit($children[0]);
+
+        if ($ctx->IN() !== null) {
+            $exprs = $ctx->expression();   
+            $lo = $this->visit($exprs[0]);
+            $hi = $this->visit($exprs[1]);
+            $inRange = ($result >= $lo && $result <= $hi);
+
+            return $ctx->NOT_KW() !== null ? !$inRange : $inRange;
+        }
+
         if (count($children) === 1) return $result;
         for ($i = 1; $i < count($children); $i++) {
             $right = $this->visit($children[$i]);

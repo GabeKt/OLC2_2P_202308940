@@ -228,6 +228,29 @@ class TypeChecker extends GrammarBaseVisitor {
     // VALIDACION DE TIPOS EN EXPRESIONES LOGICAS
     public function visitComparison($ctx) {
 
+        if ($ctx->IN() !== null) {
+            $valType = $this->visit($ctx->addition(0));
+            $valType = $this->baseType($valType);
+
+            $exprs = $ctx->expression();
+            $loType = $this->baseType($this->visit($exprs[0]));
+            $hiType = $this->baseType($this->visit($exprs[1]));
+
+            if (!$this->isNumeric($valType) && $valType !== 'unknown') {
+                $this->errorReporter->add(
+                    new \Error\CompilerError(
+                        "Error de Tipo",
+                        "El operador 'in' requiere un valor numérico, se recibió '$valType'",
+                        $ctx->getStart()->getLine(),
+                        $ctx->getStart()->getCharPositionInLine()
+                    )
+                );
+                return "error";
+            }
+
+            return "bool";
+        }
+
         return $this->checkBinaryChain($ctx, $ctx->addition(), "bool");
 
     }
@@ -243,7 +266,12 @@ class TypeChecker extends GrammarBaseVisitor {
     // IGUALDAD
     public function visitEquality($ctx) { // == y !=
 
-        return $this->checkBinaryChain($ctx, $ctx->comparison(), "bool");
+        $comparisons = $ctx->comparison();
+        if ($comparisons === null || count($comparisons) === 0) {
+            return "bool";
+        }
+
+        return $this->checkBinaryChain($ctx, $comparisons, "bool");
 
     }
 
@@ -770,6 +798,10 @@ class TypeChecker extends GrammarBaseVisitor {
     // Helper para validar cadenas de operaciones binarias (e.g. a + b + c + d)
 
     private function checkBinaryChain($ctx, $children, $operatorType) {
+
+        if ($children === null || count($children) === 0 || $children[0] === null) {
+            return "unknown";
+        }
 
         $resultType = $this->visit($children[0]);
 

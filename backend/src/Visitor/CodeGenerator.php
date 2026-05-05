@@ -1092,7 +1092,44 @@ public function visitShortVarDecl($ctx): void {
 
     public function visitComparison($ctx): void {
         $children = $ctx->addition();
-        $this->visit($children[0]);
+        $this->visit($children[0]);  
+
+ 
+        if ($ctx->IN() !== null) {
+            $isNot  = ($ctx->NOT_KW() !== null);
+            $exprs  = $ctx->expression();   
+            $labelTrue  = $this->newLabel('range_t');
+            $labelFalse = $this->newLabel('range_f');
+            $labelEnd   = $this->newLabel('range_end');
+
+ 
+            $this->instr('mov', 'x19', 'x0');
+
+    
+            $this->visitExprIntoX0($exprs[0]);
+            $this->instr('cmp', 'x19', 'x0');
+            $this->instr('b.lt', $labelFalse); 
+
+  
+            $this->visitExprIntoX0($exprs[1]);
+            $this->instr('cmp', 'x19', 'x0');
+            $this->instr('b.gt', $labelFalse);   
+
+  
+            $this->emitLabel($labelTrue);
+            $this->loadImmediate('x0', $isNot ? 0 : 1);
+            $this->instr('b', $labelEnd);
+
+ 
+            $this->emitLabel($labelFalse);
+            $this->loadImmediate('x0', $isNot ? 1 : 0);
+
+            $this->emitLabel($labelEnd);
+            $this->lastResultWasFloat = false;
+            return;
+        }
+
+ 
         if (count($children) === 1) return;
 
         for ($i = 1; $i < count($children); $i++) {
@@ -1102,13 +1139,11 @@ public function visitShortVarDecl($ctx): void {
             $labelE = $this->newLabel('cmp_e');
 
             if ($isFloat) {
-                // Guardar LHS (s0) en stack, evaluar RHS, recuperar LHS en s19
                 $this->instr('sub', 'sp', 'sp', '#16');
                 $this->instr('str', 's0', '[sp, #0]');
                 $this->visit($children[$i]);
                 $this->instr('ldr', 's19', '[sp, #0]');
                 $this->instr('add', 'sp', 'sp', '#16');
-                // fcmp s19 (LHS), s0 (RHS)
                 $this->instr('fcmp', 's19', 's0');
                 $branch = match($op) {
                     '<'  => 'b.lt',
@@ -1123,7 +1158,7 @@ public function visitShortVarDecl($ctx): void {
                 $this->emitLabel($labelT);
                 $this->loadImmediate('x0', 1);
                 $this->emitLabel($labelE);
-                $this->lastResultWasFloat = false; // resultado es bool en x0
+                $this->lastResultWasFloat = false;
             } else {
                 $this->instr('mov', 'x19', 'x0');
                 $this->visit($children[$i]);

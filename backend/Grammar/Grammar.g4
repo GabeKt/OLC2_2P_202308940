@@ -185,7 +185,12 @@ equality
 
 comparison
     : addition ((MENORQ | MENORIGUAL | MAYORQ | MAYORIGUAL) addition)*
+    | addition IN     LBRACKET expression DOTDOT expression RBRACKET
+    | addition NOT_KW IN LBRACKET expression DOTDOT expression RBRACKET
     ;
+
+
+
 
 addition
     : multiplication ((PLUS | MINUS) multiplication)*
@@ -344,6 +349,8 @@ DEFAULT  : 'default' ;
 RETURN   : 'return' ;
 BREAK    : 'break' ;
 CONTINUE : 'continue' ;
+IN: 'in';
+NOT_KW: 'not' ;
 NIL      : 'nil' ;
 TRUE     : 'true' ;
 FALSE    : 'false' ;
@@ -362,6 +369,8 @@ LEN     : 'len' ;
 NOW     : 'now' ;
 SUBSTR  : 'substr' ;
 TYPEOF  : 'typeOf' ;
+
+
 
 
 //  OPERADORES Y SÍMBOLOS
@@ -404,6 +413,7 @@ RBRACKET : ']' ;
 PUNTOYCOM: ';' ;
 DOSPUNTOS: ':' ;
 COMMA    : ',' ;
+DOTDOT   : '..' ;
 PUNTO    : '.' ;
 
 //  LITERALES DE DATOS
@@ -461,7 +471,6 @@ WS
 
 
 fragment HEX_DIGIT : [0-9a-fA-F] ;
-
 
 
 
